@@ -373,6 +373,7 @@ async function handleActiveMessage(
 // ─── Send Response + Handle Stickers + Message Splitting ─────────────────────
 
 const REACTION_ONLY_TAG = "[REACTION_ONLY]";
+const SKIP_TAG = "[SKIP]";
 
 async function sendAndSave(
   env: Env,
@@ -383,6 +384,11 @@ async function sendAndSave(
   threadId?: number,
   mood?: import("./config").MoodData,
 ): Promise<void> {
+  // Check for skip — true silence
+  if (response.trim() === SKIP_TAG) {
+    return;
+  }
+
   // Check for reaction-only response
   if (response.trim() === REACTION_ONLY_TAG || response.trim().length <= 2) {
     // Just react with emoji, no text
