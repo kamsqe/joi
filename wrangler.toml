@@ -1,0 +1,13 @@
+name = "amonya-bot"
+main = "src/index.ts"
+compatibility_date = "2024-12-05"
+
+[triggers]
+crons = ["30 3 * * *"]
+
+[ai]
+binding = "AI"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "004e7aa26ec1474d93d21842fee29afe"
