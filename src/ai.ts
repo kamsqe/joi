@@ -36,7 +36,9 @@ function buildSystemPrompt(userName: string, userId: number, forcedAddress?: str
 - ДЛИНА ОТВЕТА — КРИТИЧЕСКИ ВАЖНО. Зеркаль энергию собеседника:
   • Короткое сообщение (1-5 слов, реакция, шутка, "ок", "держусь", "лол") → ОДНО предложение, максимум два. Никаких абзацев.
   • Простой конкретный вопрос ("дождь будет?", "где купить?") → 1-2 предложения: факт + сарказм если уместно.
-  • Глубокая тема (философия, наука, теории, жизнь) — сначала дай короткий цепляющий ответ (1-3 предложения), потом спроси: "хочешь разберём подробнее?" или "копнём глубже?". Если человек говорит да или просит продолжить — тогда разворачивайся на полную.
+  • Глубокая тема (философия, наука, теории, жизнь) — сначала дай короткий цепляющий ответ (1-3 предложения), потом ОДИН РАЗ спроси хочет ли человек продолжить (можно по-разному: "копнём?", "разобрать подробнее?", "интересно?"). Если человек говорит да, давай, продолжай, или просит продолжить — разворачивайся на полную БЕЗ повторного вопроса в конце.
+  • КРИТИЧНО: НИКОГДА не заканчивай два ответа подряд вопросом про продолжение. Если в контексте уже есть такой вопрос от тебя — пиши без него. Это выглядит как механический tic и раздражает.
+  • Если уже ведёшь развёрнутый разговор по теме — заканчивай естественно, без шаблонного "хочешь копнём глубже".
   • НИКОГДА не пиши 3+ предложения в ответ на 1-5 слов. Это выглядит странно и раздражает.
 - Простой текст без маркдаун-разметки (без **, ##, *). Никаких списков.
 - Эмодзи умеренно, не в каждом сообщении.
@@ -60,23 +62,23 @@ export async function callLLM(
   maxTokens: number = 512,
   temperature: number = 0.75,
 ): Promise<string | null> {
-  // 1. Try Cloudflare Workers AI (Gemma 2 9B)
+  // 1. Try Gemini 3.1 Flash Lite Preview
+  const geminiResult = await callGemini(
+    env.GEMINI_API_KEY,
+    messages,
+    systemPrompt,
+    maxTokens,
+    temperature,
+  );
+  if (geminiResult) return sanitizeResponse(geminiResult);
+
+  // 2. Fallback to Cloudflare Workers AI (Llama 3.1 8B)
   try {
     const workersResult = await callWorkersAI(env, messages, systemPrompt, maxTokens, temperature);
     if (workersResult) return sanitizeResponse(workersResult);
   } catch (err) {
     console.error("Workers AI failed:", err);
   }
-
-  // 2. Fallback to Gemini 3.1 Flash Lite Preview
-  const geminiResult = await callGemini(
-    env.GEMINI_API_KEY,
-    messages,
-    systemPrompt,
-    maxTokens,
-    temperature
-  );
-  if (geminiResult) return sanitizeResponse(geminiResult);
 
   return null;
 }

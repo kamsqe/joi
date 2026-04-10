@@ -224,6 +224,9 @@ const SEARCH_KEYWORDS = [
 const FACT_KEYWORDS = [
   "правда ли", "правда что", "это правда", "верно ли",
   "проверь факт", "фактчек",
+  "проверь так", "так ли это", "это так", "это верно", "это точно",
+  "проверь это", "правда ли это", "на факты", "проверь на",
+  "так ли", "точно ли", "верно что",
 ];
 
 function detectIntent(text: string): "search" | "fact" | "chat" {
@@ -400,7 +403,12 @@ async function handleReply(
     forwardContext = `сообщение`;
   }
 
-  const intent = detectIntent(text);
+  let intent = detectIntent(text);
+
+  // If no keyword match, use LLM classification for longer messages
+  if (intent === "chat" && text.length > 8) {
+    intent = await llmDetectIntent(env, text);
+  }
 
   if (intent === "fact") {
     await handleFact(env, ctx, chatId, messageId, userId, repliedText, message, threadId);
