@@ -111,6 +111,23 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
     return;
   }
 
+  // ─── Troll Cooldown (VIP group only) ────────────────────────────────────────
+  if (chatId === VIP_GROUP_ID) {
+    const isLowEffort = isLowEffortMessage(text, hasMedia, message);
+    if (isLowEffort) {
+      const streak = await getTrollStreak(env, chatId, userId);
+      const threshold = userId === 271113269 ? 2 : 3; // Rustem gets shorter leash
+      if (streak >= threshold) {
+        // Skip entirely — she's done with this person's spam
+        return;
+      }
+      ctx.waitUntil(incrementTrollStreak(env, chatId, userId));
+    } else {
+      // Real message — reset streak
+      ctx.waitUntil(resetTrollStreak(env, chatId, userId));
+    }
+  }
+
   // ─── Bare Name Call Detection ("джой" without context) ────────────────────
   if (text && isBareNameCall(text)) {
     const bareResponses = ["ау?", "ау", "да?", "че", "м?", "слушаю", "хм?", "ну?"];
@@ -712,4 +729,43 @@ async function handleCron(env: Env): Promise<void> {
       await processReminder(env, reminder);
     }
   }
+}
+
+// ─── Troll Cooldown Helpers ──────────────────────────────────────────────────
+
+function isLowEffortMessage(text: string, hasMedia: boolean, message: TelegramMessage): boolean {
+  // Stickers, GIFs, media-only = low effort
+  if (!text && hasMedia) return true;
+  if (message.sticker) return true;
+  if (message.animation) return true;
+
+  // Very short text (<5 chars), likely gibberish or one-word trolling
+  if (text && text.length < 5 && !text.includes("напомни")) return true;
+
+  // Gibberish detection: mostly non-Cyrillic, non-Latin meaningful text
+  if (text && text.length > 0) {
+    const meaningful = text.replace(/[^a-zA-Zа-яА-ЯёЁ\s]/g, "").trim();
+    if (meaningful.length < 3 && text.length > 3) return true;
+  }
+
+  return false;
+}
+
+const TROLL_STREAK_TTL = 600; // 10 minutes — streak resets after inactivity
+
+async function getTrollStreak(env: Env, chatId: number, userId: number): Promise<number> {
+  const key = `troll:${chatId}:${userId}`;
+  const val = await env.KV.get(key);
+  return val ? parseInt(val, 10) : 0;
+}
+
+async function incrementTrollStreak(env: Env, chatId: number, userId: number): Promise<void> {
+  const key = `troll:${chatId}:${userId}`;
+  const current = await getTrollStreak(env, chatId, userId);
+  await env.KV.put(key, String(current + 1), { expirationTtl: TROLL_STREAK_TTL });
+}
+
+async function resetTrollStreak(env: Env, chatId: number, userId: number): Promise<void> {
+  const key = `troll:${chatId}:${userId}`;
+  await env.KV.delete(key);
 }
