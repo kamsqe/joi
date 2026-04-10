@@ -35,6 +35,7 @@ export interface TelegramMessage {
   forward_from?: TelegramUser;
   message_thread_id?: number;
   is_topic_message?: boolean;
+  entities?: Array<{ type: string; offset: number; length: number; user?: TelegramUser }>;
 }
 
 export interface TelegramUser {

@@ -216,7 +216,12 @@ function shouldRespondInGroup(message: TelegramMessage, text: string): boolean {
   // Reply to Joi's own message
   if (message.reply_to_message?.from?.username === BOT_USERNAME) return true;
 
-  // Bot name mentioned
+  // Bot @username in entities (works for bot-to-bot mentions)
+  if (message.entities?.some((e) =>
+    e.type === "mention" && text.slice(e.offset, e.offset + e.length).toLowerCase() === `@${BOT_USERNAME}`
+  )) return true;
+
+  // Bot name mentioned in text
   const lower = text.toLowerCase();
   return BOT_NAME_VARIANTS.some((variant) => lower.includes(variant));
 }
