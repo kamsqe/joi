@@ -5,8 +5,8 @@ import { BOT_USERNAME, BOT_NAME_VARIANTS } from "./config";
 import { parseUpdate, sendMessage, setMessageReaction, formatForTelegram, sanitizeResponse } from "./telegram";
 import { isKnownUser, getUserName, getPrimaryName } from "./users";
 import { saveUserMessage, saveBotMessage } from "./context";
-import { chat, chatWithContext, generateWeatherComment, generateSearchQuery, generateSpontaneousComment, llmDetectIntent } from "./ai";
-import { searchWeb } from "./search";
+import { chat, chatWithContext, generateWeatherComment, generateSearchQuery, generateSpontaneousComment, llmDetectIntent, optimizeSearchQuery } from "./ai";
+import { searchWeb, formatSources } from "./search";
 import { fetchWeather } from "./weather";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
@@ -266,16 +266,23 @@ async function handleFact(
     return;
   }
 
+  // Optimize long/conversational claims before searching
+  const searchQuery = factText.length > 30
+    ? await optimizeSearchQuery(env, factText)
+    : factText;
+
   // Search for evidence
-  const searchResults = await searchWeb(env, factText);
-  const context = searchResults ?? "Не удалось найти информацию в интернете.";
+  const searchResult = await searchWeb(env, searchQuery);
+  const context = searchResult?.context ?? "Не удалось найти информацию в интернете.";
 
   const prompt = `Пользователь задал вопрос/факт в чате. Используя найденную ниже справку, ответь ему четко, живо и по-пацански (без занудства "по результатам поиска"). Оцени достоверность:\n\nВопрос/Факт: ${factText}`;
 
   const response = await chatWithContext(env, prompt, context, userId, chatId);
 
   if (response) {
-    const sent = await sendMessage(env, chatId, formatForTelegram(response), messageId, threadId);
+    const sourcesFooter = searchResult ? formatSources(searchResult.sources) : "";
+    const fullResponse = formatForTelegram(response) + sourcesFooter;
+    const sent = await sendMessage(env, chatId, fullResponse, messageId, threadId);
     if (sent) ctx.waitUntil(saveBotMessage(env, chatId, response));
   } else {
     await handleProviderFailure(env, chatId, messageId, userId, factText, "fact", threadId);
@@ -311,23 +318,30 @@ async function handleSearch(
     searchQuery = generated;
   }
 
-  const searchResults = await searchWeb(env, searchQuery);
+  // Optimize conversational/long queries before hitting Tavily
+  const effectiveQuery = searchQuery.length > 30
+    ? await optimizeSearchQuery(env, searchQuery)
+    : searchQuery;
 
-  if (!searchResults) {
+  const searchResult = await searchWeb(env, effectiveQuery);
+
+  if (!searchResult) {
     await sendMessage(env, chatId, "Ничего не нашел по этому запросу", messageId, threadId);
     return;
   }
 
   const response = await chatWithContext(
     env,
-    `Используя найденную ниже информацию (поисковый запрос "${searchQuery}"), расскажи ответ живо, кратко и с уместным сарказмом. Ни в коем случае не пиши скучно или как робот.`,
-    searchResults,
+    `Используя найденную ниже информацию (поисковый запрос "${effectiveQuery}"), расскажи ответ живо, кратко и с уместным сарказмом. Ни в коем случае не пиши скучно или как робот.`,
+    searchResult.context,
     userId,
     chatId,
   );
 
   if (response) {
-    const sent = await sendMessage(env, chatId, formatForTelegram(response), messageId, threadId);
+    const sourcesFooter = formatSources(searchResult.sources);
+    const fullResponse = formatForTelegram(response) + sourcesFooter;
+    const sent = await sendMessage(env, chatId, fullResponse, messageId, threadId);
     if (sent) ctx.waitUntil(saveBotMessage(env, chatId, response));
   } else {
     await handleProviderFailure(env, chatId, messageId, userId, searchQuery, "search", threadId);
@@ -450,7 +464,8 @@ async function handleSpontaneous(
     // 3% chance (12-15% range): spontaneous comment
     const comment = await generateSpontaneousComment(env, text, userId, chatId);
     if (comment) {
-      await sendMessage(env, chatId, formatForTelegram(comment), undefined, undefined);
+      await sendMessage(env, chatId, formatForTelegram(comment), messageId, undefined);
+      await saveBotMessage(env, chatId, comment);
     }
   }
 }
@@ -520,8 +535,8 @@ async function processRetryQueue(env: Env): Promise<void> {
 
     switch (task.intent) {
       case "fact": {
-        const searchResults = await searchWeb(env, task.text);
-        const context = searchResults ?? "Не удалось найти информацию.";
+        const searchResult = await searchWeb(env, task.text);
+        const context = searchResult?.context ?? "Не удалось найти информацию.";
         response = await chatWithContext(
           env,
           `Проверь факт: ${task.text}`,
@@ -533,12 +548,12 @@ async function processRetryQueue(env: Env): Promise<void> {
       }
 
       case "search": {
-        const searchResults = await searchWeb(env, task.text);
-        if (searchResults) {
+        const searchResult = await searchWeb(env, task.text);
+        if (searchResult) {
           response = await chatWithContext(
             env,
-            `Суммаризируй: ${task.text}`,
-            searchResults,
+            `Суммаризуй: ${task.text}`,
+            searchResult.context,
             task.userId,
             task.chatId,
           );

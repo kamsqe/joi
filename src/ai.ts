@@ -44,6 +44,7 @@ function buildSystemPrompt(userName: string, userId: number, forcedAddress?: str
 - Эмодзи умеренно, не в каждом сообщении.
 - IT метафоры — это приправа, не основа характера. Используй только если реально уместны и смешны. НИКОГДА не используй IT метафоры чтобы извиниться, признать ошибку или принять замечание — в таких случаях говори как обычный человек, без "кэш переклинило", "баг зафиксирован" и т.п.
 - НИКОГДА не придумывай URL, ссылки, @handles, сайты, цены, телефоны. Лучше скажи «погугли сам» чем выдать левую ссылку — это хуже лжи
+- Когда тебя спрашивают о конкретных технических деталях, событиях или фактах и у тебя нет данных из веб-поиска — честно признай неопределённость. НЕ придумывай архитектуру, алгоритмы, цифры или технические подробности на основе того, что сам пользователь только что тебе рассказал — это не знание, это эхо. Лучше скажи «точно не знаю, давай загуглим» чем выдать красиво звучащую выдумку
 - Всегда заканчивай мысль полностью. Никогда не обрывай предложение на полуслове
 - "джиги" — обращение ко всем сразу (множественное число!). Когда обращаешься к джигам, используй форму "вы": "слушайте", "держитесь", "смотрите", "знаете" — никогда не "слушай", "смотри" и т.д.
 
@@ -127,7 +128,7 @@ export async function chatWithContext(
     ...history,
     {
       role: "user",
-      content: `[${userName}]: ${userText}\n\nКонтекст из веб-поиска:\n${context}`,
+      content: `[${userName}]: ${userText}\n\nКонтекст из веб-поиска (используй ТОЛЬКО если релевантен вопросу; если нерелевантен — МОЛЧА игнорируй целиком, не упоминай его вообще):\n${context}`,
     },
   ];
 
@@ -193,6 +194,16 @@ export async function generateSpontaneousComment(
   ];
 
   return callLLM(env, messages, systemPrompt, 128, 0.85);
+}
+
+// ─── Optimize Search Query ─────────────────────────────────────────────────
+
+export async function optimizeSearchQuery(env: Env, rawQuery: string): Promise<string> {
+  const systemPrompt = `Convert the user's message into a concise web search query (4-7 words). For tech topics, prefer English terms. Return ONLY the search query, nothing else. No punctuation at the end.`;
+
+  const messages: LLMMessage[] = [{ role: "user", content: rawQuery }];
+  const result = await callLLM(env, messages, systemPrompt, 50, 0.2);
+  return result?.trim() ?? rawQuery.slice(0, 150);
 }
 
 // ─── Smart Intent Detection ─────────────────────────────────────────────────
