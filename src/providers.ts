@@ -18,12 +18,18 @@ export async function callWorkersAI(
   ];
 
   try {
-    const result = await (env.AI as any).run("@cf/google/gemma-2-9b-it", {
+    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000));
+    const aiCall = (env.AI as any).run("@cf/meta/llama-3.1-8b-instruct", {
       messages: aiMessages,
       max_tokens: maxTokens,
       temperature,
-    }) as { response?: string };
+    }) as Promise<{ response?: string }>;
 
+    const result = await Promise.race([aiCall, timeout]);
+    if (!result) {
+      console.warn("Workers AI timed out, falling back to Gemini");
+      return null;
+    }
     return result.response ?? null;
   } catch (err) {
     console.error("Workers AI error:", err);

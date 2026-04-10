@@ -27,10 +27,17 @@ export function getUserName(userId: number): string {
   return user.names[Math.floor(Math.random() * user.names.length)];
 }
 
+const BOSS_ID = 163421204;
+const BOSS_ADDRESSES = ["шеф", "босс", "уважаемый", "шефуля"];
+
 export function getRandomAddress(userId: number): string {
+  if (userId === BOSS_ID) {
+    return BOSS_ADDRESSES[Math.floor(Math.random() * BOSS_ADDRESSES.length)];
+  }
+
   const user = USERS[userId];
   const genericTerms = ["брат", "бауырым", "родной", "братан"];
-  
+
   if (!user || Math.random() < 0.5) {
     return genericTerms[Math.floor(Math.random() * genericTerms.length)];
   }
