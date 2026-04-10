@@ -42,14 +42,24 @@ export async function appendToBuffer(
 
 // ─── Build LLM History from Buffer ──────────────────────────────────────────
 
+const MAX_HISTORY_MESSAGES = 20;
+const MAX_CONTENT_LENGTH = 600;
+
 export function buildLLMHistory(buffer: BufferMessage[]): LLMMessage[] {
   const messages: LLMMessage[] = [];
 
-  for (const msg of buffer) {
+  // Only send last N messages to avoid context bloat on long conversations
+  const recent = buffer.slice(-MAX_HISTORY_MESSAGES);
+
+  for (const msg of recent) {
+    const raw = msg.content.length > MAX_CONTENT_LENGTH
+      ? msg.content.slice(0, MAX_CONTENT_LENGTH) + "…"
+      : msg.content;
+
     const content =
       msg.role === "user" && msg.userName
-        ? `[${msg.userName}]: ${msg.content}`
-        : msg.content;
+        ? `[${msg.userName}]: ${raw}`
+        : raw;
 
     messages.push({
       role: msg.role === "assistant" ? "assistant" : "user",

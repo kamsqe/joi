@@ -15,16 +15,33 @@ export async function sendMessage(
 ): Promise<TelegramMessage | null> {
   const url = `${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
 
-  // Telegram limit: 4096 chars
-  const truncated = text.length > 4000 ? text.slice(0, 4000) + "..." : text;
+  // Split long messages at sentence boundaries
+  const parts = splitMessage(text);
+
+  // Send all parts except last, then fall through for the last one
+  for (let i = 0; i < parts.length - 1; i++) {
+    await fetch(`${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: parts[i],
+        parse_mode: "HTML",
+        ...(replyToMessageId && i === 0 ? { reply_to_message_id: replyToMessageId } : {}),
+        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+      }),
+    });
+  }
+
+  const finalText = parts[parts.length - 1];
 
   const body: Record<string, unknown> = {
     chat_id: chatId,
-    text: truncated,
+    text: finalText,
     parse_mode: "HTML",
   };
 
-  if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
+  if (replyToMessageId && parts.length === 1) body.reply_to_message_id = replyToMessageId;
   if (messageThreadId) body.message_thread_id = messageThreadId;
 
   try {
@@ -133,6 +150,36 @@ export function formatForTelegram(text: string): string {
   return result;
 }
 
+// ─── Split Message at Sentence Boundary ────────────────────────────────────
+
+const MAX_MSG_LEN = 3800;
+
+export function splitMessage(text: string): string[] {
+  if (text.length <= MAX_MSG_LEN) return [text];
+
+  const parts: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > MAX_MSG_LEN) {
+    const chunk = remaining.slice(0, MAX_MSG_LEN);
+
+    // Find last sentence boundary within chunk
+    const lastBreak = Math.max(
+      chunk.lastIndexOf(". "),
+      chunk.lastIndexOf("! "),
+      chunk.lastIndexOf("? "),
+      chunk.lastIndexOf("\n\n"),
+    );
+
+    const cutAt = lastBreak > MAX_MSG_LEN * 0.5 ? lastBreak + 1 : MAX_MSG_LEN;
+    parts.push(remaining.slice(0, cutAt).trim());
+    remaining = remaining.slice(cutAt).trim();
+  }
+
+  if (remaining.length > 0) parts.push(remaining);
+  return parts;
+}
+
 // ─── Sanitize LLM Response ──────────────────────────────────────────────────
 
 export function sanitizeResponse(text: string): string {
@@ -140,9 +187,6 @@ export function sanitizeResponse(text: string): string {
 
   // Remove CJK characters (Chinese/Japanese/Korean ideographs)
   result = result.replace(/[\u4E00-\u9FFF\u3400-\u4DBF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEF]/g, "");
-
-  // Remove German special characters
-  result = result.replace(/[äöüßÄÖÜ]/g, "");
 
   // Collapse excessive whitespace (3+ newlines → double newline)
   result = result.replace(/\n{3,}/g, "\n\n");
