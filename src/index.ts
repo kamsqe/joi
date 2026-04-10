@@ -196,8 +196,8 @@ function shouldRespondInGroup(message: TelegramMessage, text: string): boolean {
   // Commands
   if (text.startsWith("/")) return true;
 
-  // Reply to bot's message
-  if (message.reply_to_message?.from?.is_bot) return true;
+  // Reply to Joi's own message
+  if (message.reply_to_message?.from?.username === BOT_USERNAME) return true;
 
   // Bot name mentioned
   const lower = text.toLowerCase();
