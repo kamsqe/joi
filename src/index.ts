@@ -268,7 +268,7 @@ async function handleFact(
 
   // Optimize long/conversational claims before searching
   const searchQuery = factText.length > 30
-    ? await optimizeSearchQuery(env, factText)
+    ? await optimizeSearchQuery(env, factText, chatId)
     : factText;
 
   // Search for evidence
@@ -320,7 +320,7 @@ async function handleSearch(
 
   // Optimize conversational/long queries before hitting Tavily
   const effectiveQuery = searchQuery.length > 30
-    ? await optimizeSearchQuery(env, searchQuery)
+    ? await optimizeSearchQuery(env, searchQuery, chatId)
     : searchQuery;
 
   const searchResult = await searchWeb(env, effectiveQuery);

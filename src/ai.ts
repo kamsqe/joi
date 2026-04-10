@@ -198,10 +198,17 @@ export async function generateSpontaneousComment(
 
 // ─── Optimize Search Query ─────────────────────────────────────────────────
 
-export async function optimizeSearchQuery(env: Env, rawQuery: string): Promise<string> {
-  const systemPrompt = `Convert the user's message into a concise web search query (4-7 words). For tech topics, prefer English terms. Return ONLY the search query, nothing else. No punctuation at the end.`;
+export async function optimizeSearchQuery(env: Env, rawQuery: string, chatId?: number): Promise<string> {
+  let contextHint = "";
+  if (chatId) {
+    const buffer = await getBuffer(env, chatId);
+    const recent = buffer.slice(-3).map((m) => m.content.slice(0, 200));
+    if (recent.length > 0) contextHint = `\n\nRecent conversation for context:\n${recent.join("\n")}`;
+  }
 
-  const messages: LLMMessage[] = [{ role: "user", content: rawQuery }];
+  const systemPrompt = `Convert the user's message into a concise web search query (4-7 words). Use the recent conversation to understand the topic. For tech topics, prefer English terms. Return ONLY the search query, nothing else. No punctuation at the end.`;
+
+  const messages: LLMMessage[] = [{ role: "user", content: rawQuery + contextHint }];
   const result = await callLLM(env, messages, systemPrompt, 50, 0.2);
   return result?.trim() ?? rawQuery.slice(0, 150);
 }
