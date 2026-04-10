@@ -139,6 +139,7 @@ export const BOT_NAME_VARIANTS = [
 ];
 
 export const VIP_GROUP_ID = -1003199433987;
+export const VIP_PROACTIVE_TOPIC_ID = 16208;
 
 export const DAILY_RATE_LIMIT = 50;
 

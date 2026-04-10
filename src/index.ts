@@ -1,7 +1,7 @@
 // ─── Joi Bot — Main Entry Point ─────────────────────────────────────────────
 
 import type { Env, TelegramMessage } from "./config";
-import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID } from "./config";
+import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID, VIP_PROACTIVE_TOPIC_ID } from "./config";
 import { parseUpdate, sendMessage, sendSticker, sendChatAction, setMessageReaction, formatForTelegram } from "./telegram";
 import { resolveUserName, registerActiveChat, getActiveChats, isFirstContact, isThirdPartyNicknameRequest } from "./users";
 import { saveUserMessage, saveBotMessage } from "./context";
@@ -421,9 +421,9 @@ async function sendAndSave(
   // Split by --- separator (LLM-generated message splits)
   const parts = cleanText.split(/\n?---\n?/).map((p) => p.trim()).filter((p) => p.length > 0);
 
-  // Send each part as a separate message
+  // Send each part as a separate message, chaining replies to stay in topic
+  let lastSentId = messageId;
   for (let i = 0; i < parts.length; i++) {
-    const isFirst = i === 0;
     const formatted = formatForTelegram(parts[i]);
 
     // Send typing indicator between split messages
@@ -435,10 +435,13 @@ async function sendAndSave(
 
     const sent = await sendMessage(
       env, chatId, formatted,
-      isFirst ? messageId : undefined,
+      lastSentId,
       threadId,
     );
-    if (sent) ctx.waitUntil(saveBotMessage(env, chatId, parts[i]));
+    if (sent) {
+      lastSentId = sent.message_id;
+      ctx.waitUntil(saveBotMessage(env, chatId, parts[i]));
+    }
   }
 
   // Send sticker if tagged (works in VIP group; sticker-only = no text parts)
@@ -665,6 +668,7 @@ async function handleCron(env: Env): Promise<void> {
     await cronMoodShift(env, chatId);
 
     // 2. Check pending follow-ups
+    const proactiveTopicId = chatId === VIP_GROUP_ID ? VIP_PROACTIVE_TOPIC_ID : undefined;
     const followUp = await checkPendingFollowUp(env, chatId);
     if (followUp.shouldSend && followUp.topicSnapshot) {
       const mood = await getMood(env, chatId);
@@ -675,7 +679,7 @@ async function handleCron(env: Env): Promise<void> {
       if (response) {
         const { cleanText } = extractStickerTag(response);
         if (cleanText) {
-          await sendMessage(env, chatId, formatForTelegram(cleanText));
+          await sendMessage(env, chatId, formatForTelegram(cleanText), undefined, proactiveTopicId);
           await saveBotMessage(env, chatId, cleanText);
           await markProactiveSent(env, chatId);
         }
@@ -695,12 +699,12 @@ async function handleCron(env: Env): Promise<void> {
       if (response) {
         const { cleanText, emotion } = extractStickerTag(response);
         if (cleanText) {
-          await sendMessage(env, chatId, formatForTelegram(cleanText));
+          await sendMessage(env, chatId, formatForTelegram(cleanText), undefined, proactiveTopicId);
           await saveBotMessage(env, chatId, cleanText);
         }
         if (emotion && chatId === VIP_GROUP_ID) {
           const sticker = pickStickerForMood(emotion as any);
-          if (sticker) await sendSticker(env, chatId, sticker.fileId);
+          if (sticker) await sendSticker(env, chatId, sticker.fileId, undefined, proactiveTopicId);
         }
         await markProactiveSent(env, chatId);
       }
