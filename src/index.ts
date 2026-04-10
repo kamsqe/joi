@@ -11,7 +11,7 @@ import { getProfile, adjustScore, setNickname, markFirstContactDone } from "./re
 import { checkRateLimit, RATE_LIMIT_MESSAGE, checkRPMThrottle, trackLLMCall, enterBlackout, getBlackoutState } from "./rate-limit";
 import type { ThrottleLevel } from "./rate-limit";
 import { shouldSendProactive, markProactiveSent, checkPendingFollowUp, scheduleFollowUp } from "./proactive";
-import { createReminder, getChatReminders, getDueReminders, processReminder, parseRelativeTime, findReminderByDescription } from "./reminders";
+import { createReminder, getChatReminders, getDueReminders, processReminder, parseRelativeTime, computeReminderDates, findReminderByDescription } from "./reminders";
 import { pickStickerForMood, extractStickerTag } from "./stickers";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
@@ -333,7 +333,7 @@ async function handleActiveMessage(
   if (reminderKeywords.some((kw) => text.toLowerCase().includes(kw))) {
     const reminderIntent = await detectReminderIntent(env, text);
     if (reminderIntent.isReminder) {
-      await handleReminderCreation(env, ctx, chatId, userId, userName, messageId, threadId, mood, profile, chatType, reminderIntent);
+      await handleReminderCreation(env, ctx, chatId, userId, userName, messageId, threadId, mood, profile, chatType, reminderIntent, text);
       return;
     }
   }
@@ -493,6 +493,7 @@ async function handleReminderCreation(
   profile: import("./config").UserProfile,
   chatType: string,
   intent: { description?: string; when?: string; recurrence?: string },
+  originalText?: string,
 ): Promise<void> {
   const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId);
 
@@ -506,26 +507,53 @@ async function handleReminderCreation(
   const remindAt = intent.when ? parseRelativeTime(intent.when) : null;
 
   if (!remindAt) {
-    const response = await chat(env, `[Пользователь хочет напоминание: "${intent.description}" но не указал когда]. Спроси когда напомнить.`, userName, systemPrompt, chatId);
+    const response = await chat(env, `[Пользователь хочет напоминание: "${intent.description}" но не указал когда или дату не удалось распознать: "${intent.when || "не указано"}"]. Спроси когда именно напомнить (дату и время).`, userName, systemPrompt, chatId);
     if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
     return;
   }
 
-  // Create the reminder
-  const reminder = await createReminder(
-    env, chatId, userId,
-    intent.description,
-    remindAt,
-    (intent.recurrence as any) || "once",
-  );
+  // Check if user wants multi-reminders ("за неделю, за день и в этот день")
+  const fullText = (originalText || intent.description || "").toLowerCase();
+  const wantsMulti = fullText.includes("за неделю") || fullText.includes("за день") ||
+    fullText.includes("напомни нам за") || fullText.includes("напомни за");
 
-  const response = await chat(
-    env,
-    `[Напоминание создано: "${intent.description}" на ${new Date(remindAt).toLocaleString("ru-RU", { timeZone: "Asia/Almaty" })}${intent.recurrence && intent.recurrence !== "once" ? `, повтор: ${intent.recurrence}` : ""}]. Подтверди создание в своём стиле.`,
-    userName, systemPrompt, chatId,
-  );
+  const formatDate = (ts: number) => new Date(ts).toLocaleString("ru-RU", {
+    timeZone: "Asia/Almaty", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit",
+  });
 
-  if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+  if (wantsMulti) {
+    // Create multiple reminders: week before, day before, day of
+    const dates = computeReminderDates(remindAt);
+    const createdDates: string[] = [];
+
+    for (const d of dates) {
+      await createReminder(env, chatId, userId, `${intent.description} (${d.label})`, d.ts, "once");
+      createdDates.push(`${d.label}: ${formatDate(d.ts)}`);
+    }
+
+    const dateList = createdDates.join(", ");
+    const response = await chat(
+      env,
+      `[Создано ${dates.length} напоминаний: ${dateList}]. Подтверди создание, перечисли ТОЧНЫЕ даты которые я тебе дал. НЕ придумывай другие даты.`,
+      userName, systemPrompt, chatId,
+    );
+    if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+  } else {
+    // Single reminder
+    await createReminder(
+      env, chatId, userId,
+      intent.description,
+      remindAt,
+      (intent.recurrence as any) || "once",
+    );
+
+    const response = await chat(
+      env,
+      `[Напоминание создано: "${intent.description}" на ${formatDate(remindAt)}${intent.recurrence && intent.recurrence !== "once" ? `, повтор: ${intent.recurrence}` : ""}]. Подтверди создание, назови ТОЧНУЮ дату которую я тебе дал. НЕ придумывай другую дату.`,
+      userName, systemPrompt, chatId,
+    );
+    if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+  }
 }
 
 // ─── List Reminders ──────────────────────────────────────────────────────────

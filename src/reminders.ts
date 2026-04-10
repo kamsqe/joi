@@ -179,26 +179,89 @@ function getNextOccurrence(
 
 // ─── Parse Time from Natural Language ────────────────────────────────────────
 
-export function parseRelativeTime(whenStr: string): number | null {
+const MONTH_MAP: Record<string, number> = {
+  "январ": 0, "феврал": 1, "март": 2, "марта": 2,
+  "апрел": 3, "ма": 4, "мая": 4, "май": 4,
+  "июн": 5, "июл": 6, "август": 7,
+  "сентябр": 8, "октябр": 9, "ноябр": 10, "декабр": 11,
+};
+
+function parseMonthName(str: string): number | null {
+  const lower = str.toLowerCase();
+  for (const [prefix, month] of Object.entries(MONTH_MAP)) {
+    if (lower.startsWith(prefix)) return month;
+  }
+  return null;
+}
+
+export function parseRelativeTime(whenStr: string, defaultHour: number = 14): number | null {
   if (!whenStr || whenStr.trim().length === 0) return null;
 
   const lower = whenStr.toLowerCase().trim();
   const now = new Date();
+  // Work in Almaty time (UTC+5)
+  const almatyOffset = 5 * 60;
+  const localNow = new Date(now.getTime() + (almatyOffset + now.getTimezoneOffset()) * 60000);
 
-  // Common patterns
+  // ─── Absolute date: "DD month" or "DD.MM" ────────────────────────────
+  // Pattern: "28 апреля", "19 мая", "25 мая в 14:00"
+  const absMatch = lower.match(/(\d{1,2})\s+([а-яё]+)/);
+  if (absMatch) {
+    const day = parseInt(absMatch[1], 10);
+    const month = parseMonthName(absMatch[2]);
+    if (month !== null && day >= 1 && day <= 31) {
+      // Extract optional time "в HH:MM" or "в HH"
+      const timeMatch = lower.match(/в\s+(\d{1,2})(?::(\d{2}))?/);
+      const hour = timeMatch ? parseInt(timeMatch[1], 10) : defaultHour;
+      const minute = timeMatch && timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+
+      let year = localNow.getFullYear();
+      const target = new Date(year, month, day, hour, minute, 0, 0);
+      // If the date is in the past, assume next year
+      if (target.getTime() < localNow.getTime()) {
+        year++;
+        target.setFullYear(year);
+      }
+      // Convert Almaty time back to UTC
+      return target.getTime() - almatyOffset * 60000;
+    }
+  }
+
+  // Pattern: "DD.MM" or "DD.MM.YYYY"
+  const dotMatch = lower.match(/(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?/);
+  if (dotMatch) {
+    const day = parseInt(dotMatch[1], 10);
+    const month = parseInt(dotMatch[2], 10) - 1;
+    let year = dotMatch[3] ? parseInt(dotMatch[3], 10) : localNow.getFullYear();
+    if (year < 100) year += 2000;
+
+    const timeMatch = lower.match(/в\s+(\d{1,2})(?::(\d{2}))?/);
+    const hour = timeMatch ? parseInt(timeMatch[1], 10) : defaultHour;
+    const minute = timeMatch && timeMatch[2] ? parseInt(timeMatch[2], 10) : 0;
+
+    const target = new Date(year, month, day, hour, minute, 0, 0);
+    if (!dotMatch[3] && target.getTime() < localNow.getTime()) {
+      target.setFullYear(target.getFullYear() + 1);
+    }
+    return target.getTime() - almatyOffset * 60000;
+  }
+
+  // ─── Relative: "завтра", "послезавтра" ────────────────────────────────
   if (lower === "завтра" || lower === "tomorrow") {
-    now.setDate(now.getDate() + 1);
-    now.setHours(10, 0, 0, 0);
-    return now.getTime();
+    const target = new Date(localNow);
+    target.setDate(target.getDate() + 1);
+    target.setHours(defaultHour, 0, 0, 0);
+    return target.getTime() - almatyOffset * 60000;
   }
 
   if (lower === "послезавтра") {
-    now.setDate(now.getDate() + 2);
-    now.setHours(10, 0, 0, 0);
-    return now.getTime();
+    const target = new Date(localNow);
+    target.setDate(target.getDate() + 2);
+    target.setHours(defaultHour, 0, 0, 0);
+    return target.getTime() - almatyOffset * 60000;
   }
 
-  // Days of week
+  // ─── Days of week ─────────────────────────────────────────────────────
   const days: Record<string, number> = {
     "понедельник": 1, "вторник": 2, "среда": 3, "среду": 3,
     "четверг": 4, "пятница": 5, "пятницу": 5,
@@ -207,16 +270,17 @@ export function parseRelativeTime(whenStr: string): number | null {
 
   for (const [name, dayNum] of Object.entries(days)) {
     if (lower.includes(name)) {
-      const currentDay = now.getDay();
+      const currentDay = localNow.getDay();
       let daysUntil = dayNum - currentDay;
       if (daysUntil <= 0) daysUntil += 7;
-      now.setDate(now.getDate() + daysUntil);
-      now.setHours(10, 0, 0, 0);
-      return now.getTime();
+      const target = new Date(localNow);
+      target.setDate(target.getDate() + daysUntil);
+      target.setHours(defaultHour, 0, 0, 0);
+      return target.getTime() - almatyOffset * 60000;
     }
   }
 
-  // "через N минут/часов/дней"
+  // ─── "через N минут/часов/дней" ───────────────────────────────────────
   const inMatch = lower.match(/через\s+(\d+)\s+(минут|час|дн|день|дней)/);
   if (inMatch) {
     const num = parseInt(inMatch[1], 10);
@@ -224,11 +288,27 @@ export function parseRelativeTime(whenStr: string): number | null {
     if (unit.startsWith("минут")) return Date.now() + num * 60 * 1000;
     if (unit.startsWith("час")) return Date.now() + num * 60 * 60 * 1000;
     if (unit.startsWith("дн") || unit.startsWith("день")) {
-      now.setDate(now.getDate() + num);
-      now.setHours(10, 0, 0, 0);
-      return now.getTime();
+      const target = new Date(localNow);
+      target.setDate(target.getDate() + num);
+      target.setHours(defaultHour, 0, 0, 0);
+      return target.getTime() - almatyOffset * 60000;
     }
   }
 
   return null;
+}
+
+// ─── Compute Offset Reminders ────────────────────────────────────────────────
+// Given a target date, returns reminder timestamps for "week before, day before, day of"
+export function computeReminderDates(targetTs: number): { label: string; ts: number }[] {
+  const weekBefore = targetTs - 7 * 24 * 60 * 60 * 1000;
+  const dayBefore = targetTs - 1 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+
+  const dates: { label: string; ts: number }[] = [];
+  if (weekBefore > now) dates.push({ label: "за неделю", ts: weekBefore });
+  if (dayBefore > now) dates.push({ label: "за день", ts: dayBefore });
+  dates.push({ label: "в этот день", ts: targetTs });
+
+  return dates;
 }

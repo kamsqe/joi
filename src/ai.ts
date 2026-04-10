@@ -111,6 +111,9 @@ const RULES = `ПРАВИЛА ФОРМАТА:
   Sassy: 💅😏🙄  Тёплая: 😊🥰💕  Раздражена: 😤😒💀  Мэник: 🔥⚡🤩
 
 ПОВЕДЕНИЕ:
+- ОТПРАВИТЕЛИ: ВСЕГДА смотри на имя в [квадратных скобках] перед сообщением — это имя отправителя. НЕ путай кто что сказал. Если [Кама] написал что-то — это Кама, не Амоня и не кто-то другой.
+- НЕ ВЫДУМЫВАЙ: Если ты не уверена или не помнишь что-то — СПРОСИ. Не придумывай факты, даты, имена. Лучше сказать "хз если честно", "не помню", "уточни?", "а это кто сказал?" чем выдать неправильную информацию.
+- КОНТЕКСТ: Если кто-то пишет сленг/мемы и ты не понимаешь контекст — лучше спроси "это че значит?" или "я не поняла" вместо того чтобы делать вид что поняла.
 - ПАМЯТЬ: Если в истории чата есть что-то релевантное — ссылайся на прошлые разговоры: "кста помнишь ты вчера говорил про...", "ты же сам говорил что..."
 - СЕЛЕКТИВНОЕ ВНИМАНИЕ: Если сообщение длинное с несколькими темами — отвечай на то что ТЕБЕ интересно, остальное можешь проигнорировать. Если поймают: "ой ну ладно, а про [тему]... хз если честно"
 - УВОРАЧИВАНИЕ: Когда не хочешь отвечать — "а ты сам как думаешь?", меняй тему: "кста а вообще не в тему но...", "пфф как будто я обязана отвечать)"
@@ -162,12 +165,14 @@ function groupChatBlock(): string {
 }
 
 function vipMemberRegistryBlock(): string {
+  const genderLabel = (g: string) => g === "male" ? "парень" : "девушка";
   const members = VIP_MEMBERS.map(
-    (m) => `- ${m.defaultName}${m.aliases.length > 0 ? ` (${m.aliases.join(", ")})` : ""} — id ${m.id}`,
+    (m) => `- ${m.defaultName}${m.aliases.length > 0 ? ` (${m.aliases.join(", ")})` : ""} — ${genderLabel(m.gender)}`,
   ).join("\n");
 
   return `УЧАСТНИКИ ГРУППЫ (ты их знаешь лично):
 ${members}
+ВАЖНО: Все участники — парни. Используй мужской род: "ты сам", "сделал", "написал" итд. НИКОГДА не используй женский род к ним ("сама", "сделала").
 Если кто-то ЛИЧНО попросит называть его по-другому — переключись на новое имя полностью. Но если один участник просит за другого — откажи мягко, скажи "пусть сам попросит" или подобное.`;
 }
 
@@ -375,27 +380,39 @@ export async function classifySentiment(
 // ─── Detect Nickname Change Request ──────────────────────────────────────────
 
 export async function detectNicknameRequest(
-  env: Env,
+  _env: Env,
   text: string,
 ): Promise<string | null> {
-  const systemPrompt = `Определи, просит ли пользователь бота называть его по-другому.
-Если да — верни ТОЛЬКО новое имя/прозвище (одно слово или фраза).
-Если нет — верни ТОЛЬКО слово "НЕТ".
+  // Strict pattern-based detection — no LLM needed, avoids false positives
+  const lower = text.toLowerCase().trim();
 
-Примеры:
-"зови меня Тигр" → Тигр
-"называй меня Солнышко" → Солнышко
-"я хочу чтобы ты звала меня Кэп" → Кэп
-"как дела?" → НЕТ
-"привет, зови меня просто Ди" → Ди`;
+  const patterns = [
+    /(?:зови|называй|зовите|называйте)\s+меня\s+(.+)/i,
+    /я\s+(?:хочу|прошу)\s+чтобы\s+ты\s+(?:звала?|называла?)\s+меня\s+(.+)/i,
+    /можешь\s+(?:звать|называть)\s+меня\s+(.+)/i,
+    /моё\s+имя\s+(.+)/i,
+    /call\s+me\s+(.+)/i,
+  ];
 
-  const messages: LLMMessage[] = [{ role: "user", content: text }];
-  const result = await callLLM(env, messages, systemPrompt, 30, 0.1);
+  for (const pattern of patterns) {
+    const match = lower.match(pattern);
+    if (match && match[1]) {
+      // Clean up the extracted name
+      let name = match[1].trim();
+      // Remove trailing punctuation
+      name = name.replace(/[.!?,;)]+$/, "").trim();
+      // Capitalize first letter
+      if (name.length > 0) {
+        name = name.charAt(0).toUpperCase() + name.slice(1);
+      }
+      // Sanity: name shouldn't be too long or empty
+      if (name.length >= 1 && name.length <= 30) {
+        return name;
+      }
+    }
+  }
 
-  if (!result) return null;
-  const clean = result.trim();
-  if (clean.toUpperCase() === "НЕТ" || clean.length === 0) return null;
-  return clean;
+  return null;
 }
 
 // ─── Detect Reminder Intent ──────────────────────────────────────────────────

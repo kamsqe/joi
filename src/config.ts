@@ -149,12 +149,13 @@ export interface VipMember {
   id: number;
   defaultName: string;
   aliases: string[];
+  gender: "male" | "female";
 }
 
 export const VIP_MEMBERS: VipMember[] = [
-  { id: 1038120471, defaultName: "Кама", aliases: ["Камский"] },
-  { id: 370789625, defaultName: "Аса", aliases: ["Асеке"] },
-  { id: 271113269, defaultName: "Рус", aliases: ["Руся"] },
-  { id: 163421204, defaultName: "Босс", aliases: ["Шеф", "Шефуля"] },
-  { id: 521857800, defaultName: "Макс", aliases: [] },
+  { id: 1038120471, defaultName: "Кама", aliases: ["Камский"], gender: "male" },
+  { id: 370789625, defaultName: "Аса", aliases: ["Асеке"], gender: "male" },
+  { id: 271113269, defaultName: "Рус", aliases: ["Руся"], gender: "male" },
+  { id: 163421204, defaultName: "Босс", aliases: ["Шеф", "Шефуля"], gender: "male" },
+  { id: 521857800, defaultName: "Макс", aliases: [], gender: "male" },
 ];
