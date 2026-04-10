@@ -384,13 +384,15 @@ async function sendAndSave(
   threadId?: number,
   mood?: import("./config").MoodData,
 ): Promise<void> {
+  const trimmed = response.trim();
+
   // Check for skip — true silence
-  if (response.trim() === SKIP_TAG) {
+  if (trimmed === SKIP_TAG || trimmed.startsWith(SKIP_TAG)) {
     return;
   }
 
   // Check for reaction-only response
-  if (response.trim() === REACTION_ONLY_TAG || response.trim().length <= 2) {
+  if (trimmed.startsWith(REACTION_ONLY_TAG) || trimmed.length <= 2) {
     // Just react with emoji, no text
     await setMessageReaction(env, chatId, messageId || 0, mood?.mood);
     return;
