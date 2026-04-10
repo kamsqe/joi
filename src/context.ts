@@ -1,13 +1,12 @@
 // ─── KV-Based Rolling Message Buffer ─────────────────────────────────────────
 
 import type { Env, BufferMessage, LLMMessage } from "./config";
-import { getPrimaryName } from "./users";
 
-const MAX_BUFFER_SIZE = 50;
-const BUFFER_TTL = 60 * 60 * 24 * 7; // 7 days
+const MAX_BUFFER_SIZE = 60;
+const BUFFER_TTL = 60 * 60 * 24 * 14; // 14 days
 
 function bufferKey(chatId: number): string {
-  return `chat_buffer:${chatId}`;
+  return `buf:${chatId}`;
 }
 
 // ─── Read Buffer ─────────────────────────────────────────────────────────────
@@ -43,12 +42,12 @@ export async function appendToBuffer(
 // ─── Build LLM History from Buffer ──────────────────────────────────────────
 
 const MAX_HISTORY_MESSAGES = 20;
-const MAX_CONTENT_LENGTH = 600;
+const MAX_CONTENT_LENGTH = 500;
 
 export function buildLLMHistory(buffer: BufferMessage[]): LLMMessage[] {
   const messages: LLMMessage[] = [];
 
-  // Only send last N messages to avoid context bloat on long conversations
+  // Only send last N messages to avoid context bloat
   const recent = buffer.slice(-MAX_HISTORY_MESSAGES);
 
   for (const msg of recent) {
@@ -70,24 +69,25 @@ export function buildLLMHistory(buffer: BufferMessage[]): LLMMessage[] {
   return messages;
 }
 
-// ─── Save User Message (convenience) ────────────────────────────────────────
+// ─── Save User Message ───────────────────────────────────────────────────────
 
 export async function saveUserMessage(
   env: Env,
   chatId: number,
   userId: number,
+  userName: string,
   text: string,
 ): Promise<void> {
   await appendToBuffer(env, chatId, {
     role: "user",
     content: text,
-    userName: getPrimaryName(userId),
+    userName,
     userId,
     ts: Date.now(),
   });
 }
 
-// ─── Save Bot Message (convenience) ─────────────────────────────────────────
+// ─── Save Bot Message ────────────────────────────────────────────────────────
 
 export async function saveBotMessage(
   env: Env,

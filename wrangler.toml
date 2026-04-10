@@ -1,13 +1,13 @@
-name = "amonya-bot"
+name = "joi-bot"
 main = "src/index.ts"
 compatibility_date = "2024-12-05"
 
 [triggers]
-crons = ["30 3 * * *"]
+crons = ["*/5 * * * *"]
 
 [ai]
 binding = "AI"
 
 [[kv_namespaces]]
 binding = "KV"
-id = "004e7aa26ec1474d93d21842fee29afe"
+id = "0997f17add2045579ebdae1389b6145c"

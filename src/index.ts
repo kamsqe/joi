@@ -1,13 +1,18 @@
-// ─── Amonya Bot — Main Entry Point ──────────────────────────────────────────
+// ─── Joi Bot — Main Entry Point ─────────────────────────────────────────────
 
-import type { Env, RetryTask, TelegramMessage } from "./config";
-import { BOT_USERNAME, BOT_NAME_VARIANTS } from "./config";
-import { parseUpdate, sendMessage, setMessageReaction, formatForTelegram, sanitizeResponse } from "./telegram";
-import { isKnownUser, getUserName, getPrimaryName } from "./users";
+import type { Env, TelegramMessage } from "./config";
+import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID } from "./config";
+import { parseUpdate, sendMessage, sendSticker, sendChatAction, setMessageReaction, formatForTelegram } from "./telegram";
+import { resolveUserName, registerActiveChat, getActiveChats, isFirstContact, isThirdPartyNicknameRequest } from "./users";
 import { saveUserMessage, saveBotMessage } from "./context";
-import { chat, chatWithContext, generateWeatherComment, generateSearchQuery, generateSpontaneousComment, llmDetectIntent, optimizeSearchQuery } from "./ai";
-import { searchWeb, formatSources } from "./search";
-import { fetchWeather } from "./weather";
+import { buildSystemPrompt, chat, classifySentiment, detectNicknameRequest, detectReminderIntent, generateProactiveMessage } from "./ai";
+import { getMood, maybeSwingMood, shiftMoodBySentiment, setOffended, clearOffense, cronMoodShift } from "./mood";
+import { getProfile, adjustScore, setNickname, markFirstContactDone } from "./relationships";
+import { checkRateLimit, RATE_LIMIT_MESSAGE, checkRPMThrottle, trackLLMCall, enterBlackout, getBlackoutState } from "./rate-limit";
+import type { ThrottleLevel } from "./rate-limit";
+import { shouldSendProactive, markProactiveSent, checkPendingFollowUp, scheduleFollowUp } from "./proactive";
+import { createReminder, getChatReminders, getDueReminders, processReminder, parseRelativeTime, findReminderByDescription } from "./reminders";
+import { pickStickerForMood, extractStickerTag } from "./stickers";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
 
@@ -29,74 +34,166 @@ export default {
 
     // Health check
     if (url.pathname === "/" || url.pathname === "/health") {
-      return new Response("Amonya bot is running", { status: 200 });
+      return new Response("Joi bot is running 💅", { status: 200 });
     }
 
     return new Response("Not found", { status: 404 });
   },
 
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Daily weather at 07:30 Almaty time
-    ctx.waitUntil(handleDailyWeather(env));
-
-    // Process retry queue
-    ctx.waitUntil(processRetryQueue(env));
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(handleCron(env));
   },
 };
 
 // ─── Message Handler ────────────────────────────────────────────────────────
 
 async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramMessage): Promise<void> {
-  const text = message.text?.trim();
-  if (!text) return;
-
   const userId = message.from?.id;
   if (!userId) return;
 
   const chatId = message.chat.id;
+  const chatType = message.chat.type;
   const messageId = message.message_id;
   const threadId = message.message_thread_id;
+  const isPrivate = chatType === "private";
+  const firstName = message.from?.first_name;
 
-  const isKnown = isKnownUser(userId);
-  const isCommand = text.startsWith("/");
+  // Extract text from message or caption, detect media
+  const text = message.text?.trim() || message.caption?.trim() || "";
+  const mediaType = detectMediaType(message);
+  const hasMedia = mediaType !== null;
 
-  // Save message from known users to buffer (non-blocking)
-  if (isKnown && !isCommand) {
-    ctx.waitUntil(saveUserMessage(env, chatId, userId, text));
+  // Nothing to work with — no text and no media
+  if (!text && !hasMedia) return;
+
+  // Register chat for cron proactive messaging
+  ctx.waitUntil(registerActiveChat(env, chatId));
+
+  // Rate limit check (before any LLM calls)
+  const { allowed } = await checkRateLimit(env, chatId);
+  if (!allowed) {
+    await sendMessage(env, chatId, RATE_LIMIT_MESSAGE, messageId, threadId);
+    return;
   }
 
-  // Check if bot should respond
-  const respond = shouldRespond(message, text);
+  // Resolve user name
+  const userName = await resolveUserName(env, chatId, userId, firstName);
 
-  if (!respond) {
-    // Spontaneous reactions for known users (non-commands only)
-    if (isKnown) {
-      ctx.waitUntil(handleSpontaneous(env, chatId, messageId, text, userId));
+  // Build display text for buffer (include media marker if present)
+  const bufferText = hasMedia
+    ? (text ? `[${mediaType}] ${text}` : `[Отправил ${mediaType}]`)
+    : text;
+
+  // Save message to buffer
+  if (bufferText) ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText));
+
+  // Determine if bot should respond
+  const shouldReply = isPrivate || shouldRespondInGroup(message, text);
+
+  if (!shouldReply) {
+    // Passive processing: mood swing chance, spontaneous reactions
+    const mood = await maybeSwingMood(env, chatId);
+    ctx.waitUntil(handlePassiveInteraction(env, chatId, messageId, mood));
+
+    // Maybe schedule a delayed follow-up
+    const buffer = await import("./context").then((m) => m.getBuffer(env, chatId));
+    if (Math.random() < 0.08 && text) {
+      ctx.waitUntil(scheduleFollowUp(env, chatId, text, buffer.length));
     }
     return;
   }
 
-  // Save command messages to buffer too
-  if (isKnown && isCommand) {
-    ctx.waitUntil(saveUserMessage(env, chatId, userId, text));
+  // ─── RPM Throttle Check ─────────────────────────────────────────────────────
+  const throttle = await checkRPMThrottle(env);
+  if (throttle === "blackout") {
+    // Silently save to buffer but don't respond
+    ctx.waitUntil(enterBlackout(env, chatId));
+    return;
   }
 
-  // Clean text: strip bot mentions and command suffixes
-  const cleanText = stripBotMention(text);
+  // ─── Bare Name Call Detection ("джой" without context) ────────────────────
+  if (text && isBareNameCall(text)) {
+    const bareResponses = ["ау?", "ау", "да?", "че", "м?", "слушаю", "хм?", "ну?"];
+    const pick = bareResponses[Math.floor(Math.random() * bareResponses.length)];
+    await sendMessage(env, chatId, pick, messageId, threadId);
+    ctx.waitUntil(saveBotMessage(env, chatId, pick));
+    return;
+  }
 
-  // Route to appropriate handler
+  // ─── Media-only message (no text, addressed to Joi) ─────────────────
+  // For media with caption, we continue to full handling with the caption as text.
+  // For media WITHOUT text, we send media context to the LLM.
+  const effectiveText = text || (hasMedia ? describeMedia(message) : "");
+  if (!effectiveText) return;
+
+  // Active response path
   try {
-    await routeMessage(env, ctx, chatId, messageId, userId, cleanText, message, threadId);
+    await handleActiveMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, isPrivate, throttle);
   } catch (err) {
     console.error("Message handling error:", err);
-    await sendMessage(env, chatId, "Что-то пошло не так, попробуй ещё раз", messageId, threadId);
+    await sendMessage(env, chatId, "Что-то пошло не так... 😅", messageId, threadId);
   }
 }
 
-// ─── Should Respond ─────────────────────────────────────────────────────────
+// ─── Detect Media Type ────────────────────────────────────────────────────────
 
-function shouldRespond(message: TelegramMessage, text: string): boolean {
-  // Always respond to commands
+function detectMediaType(message: TelegramMessage): string | null {
+  if (message.photo && message.photo.length > 0) return "фото";
+  if (message.video) return "видео";
+  if (message.animation) return "гифку";
+  if (message.voice) return "голосовое";
+  if (message.video_note) return "кругляш";
+  if (message.audio) return "аудио";
+  if (message.document) return "файл";
+  if (message.sticker) return `стикер${message.sticker.emoji ? " " + message.sticker.emoji : ""}`;
+  return null;
+}
+
+// ─── Describe Media for LLM ───────────────────────────────────────────────────
+
+function describeMedia(message: TelegramMessage): string {
+  if (message.photo) return "[Отправил фото]";
+  if (message.video) return "[Отправил видео]";
+  if (message.animation) return "[Отправил гифку]";
+  if (message.voice) return `[Отправил голосовое (${message.voice.duration}с)]`;
+  if (message.video_note) return "[Отправил кругляш]";
+  if (message.audio) return `[Отправил аудио${message.audio.title ? ": " + message.audio.title : ""}]`;
+  if (message.document) return `[Отправил файл${message.document.file_name ? ": " + message.document.file_name : ""}]`;
+  if (message.sticker) return `[Отправил стикер${message.sticker.emoji ? " " + message.sticker.emoji : ""}]`;
+  return "[Отправил медиа]";
+}
+
+// ─── Bare Name Call Detection ───────────────────────────────────────────────
+
+const BARE_GREETINGS = ["\u043f\u0440\u0438\u0432\u0435\u0442", "хе\u0439", "х\u0430\u0439", "з\u0434\u0430\u0440\u043e\u0432\u0430", "\u043f\u0440\u0438\u0432", "\u0445\u0435\u043b\u043b\u043e", "hi", "hey"];
+
+function isBareNameCall(text: string): boolean {
+  const lower = text.toLowerCase().trim();
+
+  // Just the bot's name: "джой", "жой", "joi", "@joicanfixthat_bot"
+  for (const variant of BOT_NAME_VARIANTS) {
+    if (lower === variant) return true;
+  }
+
+  // Name + simple greeting: "джой привет", "привет джой"
+  let stripped = lower;
+  for (const variant of BOT_NAME_VARIANTS) {
+    stripped = stripped.replace(variant, "").trim();
+  }
+  // After removing bot name, only a greeting or nothing remains
+  if (stripped === "") return true;
+  if (BARE_GREETINGS.includes(stripped)) return true;
+  // Handle comma/excl: "джой, привет" → "привет"
+  const cleanStripped = stripped.replace(/^[,!\s]+|[,!\s]+$/g, "");
+  if (BARE_GREETINGS.includes(cleanStripped)) return true;
+
+  return false;
+}
+
+// ─── Should Respond in Group ─────────────────────────────────────────────────
+
+function shouldRespondInGroup(message: TelegramMessage, text: string): boolean {
+  // Commands
   if (text.startsWith("/")) return true;
 
   // Reply to bot's message
@@ -112,95 +209,381 @@ function shouldRespond(message: TelegramMessage, text: string): boolean {
 function stripBotMention(text: string): string {
   let result = text;
 
-  // Strip @bot_username suffix from commands
   result = result.replace(new RegExp(`@${BOT_USERNAME}`, "gi"), "");
 
-  // Strip bot name variants from text
   for (const variant of BOT_NAME_VARIANTS) {
     result = result.replace(new RegExp(variant, "gi"), "");
   }
 
-  // Clean up extra spaces
   result = result.replace(/\s+/g, " ").trim();
-
   return result;
 }
 
-// ─── Route Message ──────────────────────────────────────────────────────────
+// ─── Active Message Handling ─────────────────────────────────────────────────
 
-async function routeMessage(
+async function handleActiveMessage(
   env: Env,
   ctx: ExecutionContext,
   chatId: number,
+  chatType: string,
   messageId: number,
   userId: number,
-  text: string,
+  userName: string,
+  rawText: string,
   message: TelegramMessage,
   threadId?: number,
+  isPrivate?: boolean,
+  throttle: ThrottleLevel = "normal",
 ): Promise<void> {
-  // Command routing
-  const command = extractCommand(text);
+  const text = stripBotMention(rawText);
 
+  // Load mood & profile
+  const mood = await maybeSwingMood(env, chatId);
+  const profile = await getProfile(env, chatId, userId);
+
+  // Check blackout recovery
+  const blackout = await getBlackoutState(env, chatId);
+  let missedMessages = 0;
+  if (blackout.recoveryReady) {
+    missedMessages = blackout.missedMessages;
+  }
+
+  // Classify sentiment toward Joi — skip in lazy mode to save RPM
+  let sentimentResult: { sentiment: "positive" | "negative" | "neutral"; delta: number } = { sentiment: "neutral", delta: 0 };
+  if (throttle !== "lazy") {
+    sentimentResult = await classifySentiment(env, text);
+    ctx.waitUntil(trackLLMCall(env));
+  }
+
+  // Update relationship score
+  if (sentimentResult.delta !== 0) {
+    ctx.waitUntil(adjustScore(env, chatId, userId, sentimentResult.delta));
+  }
+
+  // Update mood based on sentiment
+  if (sentimentResult.sentiment !== "neutral") {
+    ctx.waitUntil(shiftMoodBySentiment(env, chatId, sentimentResult.sentiment));
+
+    // Check for offense (big negative delta)
+    if (sentimentResult.delta <= -10) {
+      ctx.waitUntil(setOffended(env, chatId, userId, text));
+    }
+
+    // Check for apology clearing offense
+    if (sentimentResult.sentiment === "positive" && mood.offendedBy === userId) {
+      ctx.waitUntil(clearOffense(env, chatId));
+    }
+  }
+
+  // ─── Command Routing ─────────────────────────────────────────────────────
+
+  const command = extractCommand(text);
   if (command) {
     switch (command.name) {
-      case "fact":
-      case "факт":
-        await handleFact(env, ctx, chatId, messageId, userId, command.args, message, threadId);
-        return;
-
-      case "search":
-      case "найди":
-        await handleSearch(env, ctx, chatId, messageId, userId, command.args, message, threadId);
-        return;
-
-      case "weather":
-      case "погода":
-        await handleWeather(env, ctx, chatId, messageId, threadId);
-        return;
-
       case "help":
       case "помощь":
         await handleHelp(env, chatId, messageId, threadId);
         return;
+      case "reminders":
+      case "напоминания":
+        await handleListReminders(env, chatId, messageId, threadId);
+        return;
+      case "start":
+        if (isPrivate) {
+          await handleFirstContact(env, chatId, userId, messageId, threadId);
+          return;
+        }
     }
   }
 
-  // Reply to a message (forwarded or otherwise)
+  // ─── First Contact (private chat) ────────────────────────────────────────
+
+  if (isPrivate && profile.isFirstContact) {
+    await handleFirstContact(env, chatId, userId, messageId, threadId);
+    return;
+  }
+
+  // ─── Nickname Change Detection ───────────────────────────────────────────
+
+  // Check if someone is trying to change someone ELSE's nickname (VIP only)
+  if (isThirdPartyNicknameRequest(text, userId, chatId)) {
+    const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId);
+    const response = await chat(env, `[${userName} пытается изменить чужое имя]: ${text}\n\n(Откажи мягко, скажи "пусть сам попросит" в своём стиле)`, userName, systemPrompt, chatId);
+    if (response) {
+      await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+    }
+    return;
+  }
+
+  // Check for own nickname change request
+  const nicknameRequest = await detectNicknameRequest(env, text);
+  if (nicknameRequest) {
+    await setNickname(env, chatId, userId, nicknameRequest);
+    const systemPrompt = buildSystemPrompt(mood, profile, nicknameRequest, chatType as any, chatId);
+    const response = await chat(env, `[Пользователь попросил называть его "${nicknameRequest}"]. Подтверди что будешь так называть, скажи что-нибудь милое/игривое про новое имя.`, nicknameRequest, systemPrompt, chatId);
+    if (response) {
+      await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+    }
+    return;
+  }
+
+  // ─── Reminder Detection ──────────────────────────────────────────────────
+
+  const reminderKeywords = ["напомни", "напоминай", "напоминание", "remind"];
+  if (reminderKeywords.some((kw) => text.toLowerCase().includes(kw))) {
+    const reminderIntent = await detectReminderIntent(env, text);
+    if (reminderIntent.isReminder) {
+      await handleReminderCreation(env, ctx, chatId, userId, userName, messageId, threadId, mood, profile, chatType, reminderIntent);
+      return;
+    }
+  }
+
+  // ─── Cancel Reminder Detection ───────────────────────────────────────────
+
+  const cancelKeywords = ["отмени напоминание", "удали напоминание", "cancel reminder"];
+  if (cancelKeywords.some((kw) => text.toLowerCase().includes(kw))) {
+    await handleReminderCancel(env, chatId, userId, messageId, threadId, text, mood, profile, userName, chatType);
+    return;
+  }
+
+  // ─── Default: Chat ───────────────────────────────────────────────────────
+
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages });
+
+  // Send "typing" indicator before LLM call
+  await sendChatAction(env, chatId, "typing", threadId);
+
+  // Include reply context if replying to something
+  let chatText = text;
   if (message.reply_to_message?.text || message.reply_to_message?.caption) {
-    await handleReply(env, ctx, chatId, messageId, userId, text, message, threadId);
-    return;
+    const repliedText = message.reply_to_message!.text || message.reply_to_message!.caption || "";
+    chatText = `[Ответ на сообщение: "${repliedText.slice(0, 300)}"]\n\n${text}`;
   }
 
-  // Natural language intent detection (fast Keyword matching)
-  let intent = detectIntent(text);
-
-  // If no simple keyword match but it could be a query, use Smart LLM Classification
-  if (intent === "chat" && text.length > 8) {
-    intent = await llmDetectIntent(env, text);
-  }
-
-  if (intent === "fact") {
-    await handleFact(env, ctx, chatId, messageId, userId, text, message, threadId);
-    return;
-  }
-
-  if (intent === "search") {
-    await handleSearch(env, ctx, chatId, messageId, userId, text, message, threadId);
-    return;
-  }
-
-  // Default: chat
-  const response = await chat(env, text, userId, chatId);
+  const response = await chat(env, chatText, userName, systemPrompt, chatId);
+  ctx.waitUntil(trackLLMCall(env));
 
   if (response) {
-    const sent = await sendMessage(env, chatId, formatForTelegram(response), messageId, threadId);
-    if (sent) ctx.waitUntil(saveBotMessage(env, chatId, response));
+    await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
   } else {
-    await handleProviderFailure(env, chatId, messageId, userId, text, "chat", threadId);
+    await sendMessage(env, chatId, "Не могу сейчас ответить... попробуй позже 😔", messageId, threadId);
   }
 }
 
-// ─── Command Extraction ────────────────────────────────────────────────────
+// ─── Send Response + Handle Stickers + Message Splitting ─────────────────────
+
+const REACTION_ONLY_TAG = "[REACTION_ONLY]";
+
+async function sendAndSave(
+  env: Env,
+  ctx: ExecutionContext,
+  chatId: number,
+  response: string,
+  messageId?: number,
+  threadId?: number,
+  mood?: import("./config").MoodData,
+): Promise<void> {
+  // Check for reaction-only response
+  if (response.trim() === REACTION_ONLY_TAG || response.trim().length <= 2) {
+    // Just react with emoji, no text
+    await setMessageReaction(env, chatId, messageId || 0, mood?.mood);
+    return;
+  }
+
+  // Extract sticker tag if present
+  const { cleanText, emotion } = extractStickerTag(response);
+
+  // Split by --- separator (LLM-generated message splits)
+  const parts = cleanText.split(/\n?---\n?/).map((p) => p.trim()).filter((p) => p.length > 0);
+
+  // Send each part as a separate message
+  for (let i = 0; i < parts.length; i++) {
+    const isFirst = i === 0;
+    const formatted = formatForTelegram(parts[i]);
+
+    // Send typing indicator between split messages
+    if (i > 0) {
+      await sendChatAction(env, chatId, "typing", threadId);
+      // Small delay between split messages (200-600ms)
+      await new Promise((r) => setTimeout(r, 200 + Math.random() * 400));
+    }
+
+    const sent = await sendMessage(
+      env, chatId, formatted,
+      isFirst ? messageId : undefined,
+      threadId,
+    );
+    if (sent) ctx.waitUntil(saveBotMessage(env, chatId, parts[i]));
+  }
+
+  // Send sticker if tagged and in VIP group
+  if (emotion && chatId === VIP_GROUP_ID) {
+    const sticker = pickStickerForMood(emotion as any);
+    if (sticker) {
+      await sendSticker(env, chatId, sticker.fileId, undefined, threadId);
+    }
+  }
+}
+
+// ─── Passive Interaction (not addressed) ─────────────────────────────────────
+
+async function handlePassiveInteraction(
+  env: Env,
+  chatId: number,
+  messageId: number,
+  mood: import("./config").MoodData,
+): Promise<void> {
+  const roll = Math.random() * 100;
+
+  if (roll < 10) {
+    // 10% chance: mood-influenced emoji reaction
+    await setMessageReaction(env, chatId, messageId, mood.mood);
+  }
+}
+
+// ─── First Contact Flow ──────────────────────────────────────────────────────
+
+async function handleFirstContact(
+  env: Env,
+  chatId: number,
+  userId: number,
+  messageId: number,
+  threadId?: number,
+): Promise<void> {
+  await markFirstContactDone(env, chatId, userId);
+  await sendMessage(
+    env,
+    chatId,
+    "Привет! 😊 Я Джой. Как мне тебя называть?",
+    messageId,
+    threadId,
+  );
+}
+
+// ─── Help ────────────────────────────────────────────────────────────────────
+
+async function handleHelp(
+  env: Env,
+  chatId: number,
+  messageId: number,
+  threadId?: number,
+): Promise<void> {
+  await sendMessage(env, chatId, `Я Джой 💅
+
+Просто пиши мне — я отвечу (в личке всегда, в группе когда позовёшь).
+
+Напоминания:
+"напомни мне позвонить маме завтра"
+/reminders — список напоминаний
+
+Называй как хочешь — скажи "зови меня [имя]" и я запомню ✨`, messageId, threadId);
+}
+
+// ─── Reminder Creation ───────────────────────────────────────────────────────
+
+async function handleReminderCreation(
+  env: Env,
+  ctx: ExecutionContext,
+  chatId: number,
+  userId: number,
+  userName: string,
+  messageId: number,
+  threadId: number | undefined,
+  mood: import("./config").MoodData,
+  profile: import("./config").UserProfile,
+  chatType: string,
+  intent: { description?: string; when?: string; recurrence?: string },
+): Promise<void> {
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId);
+
+  if (!intent.description) {
+    const response = await chat(env, "[Пользователь хочет создать напоминание но не указал о чём]. Спроси что напомнить.", userName, systemPrompt, chatId);
+    if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+    return;
+  }
+
+  // Try to parse the time
+  const remindAt = intent.when ? parseRelativeTime(intent.when) : null;
+
+  if (!remindAt) {
+    const response = await chat(env, `[Пользователь хочет напоминание: "${intent.description}" но не указал когда]. Спроси когда напомнить.`, userName, systemPrompt, chatId);
+    if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+    return;
+  }
+
+  // Create the reminder
+  const reminder = await createReminder(
+    env, chatId, userId,
+    intent.description,
+    remindAt,
+    (intent.recurrence as any) || "once",
+  );
+
+  const response = await chat(
+    env,
+    `[Напоминание создано: "${intent.description}" на ${new Date(remindAt).toLocaleString("ru-RU", { timeZone: "Asia/Almaty" })}${intent.recurrence && intent.recurrence !== "once" ? `, повтор: ${intent.recurrence}` : ""}]. Подтверди создание в своём стиле.`,
+    userName, systemPrompt, chatId,
+  );
+
+  if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+}
+
+// ─── List Reminders ──────────────────────────────────────────────────────────
+
+async function handleListReminders(
+  env: Env,
+  chatId: number,
+  messageId: number,
+  threadId?: number,
+): Promise<void> {
+  const reminders = await getChatReminders(env, chatId);
+
+  if (reminders.length === 0) {
+    await sendMessage(env, chatId, "Напоминаний пока нет 🤷‍♀️", messageId, threadId);
+    return;
+  }
+
+  const lines = reminders.map((r, i) => {
+    const date = new Date(r.remindAt).toLocaleString("ru-RU", { timeZone: "Asia/Almaty" });
+    const rec = r.recurrence !== "once" ? ` (${r.recurrence})` : "";
+    return `${i + 1}. ${r.description} — ${date}${rec}`;
+  });
+
+  await sendMessage(env, chatId, `📋 Напоминания:\n${lines.join("\n")}`, messageId, threadId);
+}
+
+// ─── Cancel Reminder ─────────────────────────────────────────────────────────
+
+async function handleReminderCancel(
+  env: Env,
+  chatId: number,
+  userId: number,
+  messageId: number,
+  threadId: number | undefined,
+  text: string,
+  mood: import("./config").MoodData,
+  profile: import("./config").UserProfile,
+  userName: string,
+  chatType: string,
+): Promise<void> {
+  // Extract what to cancel
+  const searchText = text.replace(/отмени напоминание|удали напоминание|cancel reminder/gi, "").trim();
+
+  if (!searchText) {
+    await sendMessage(env, chatId, "Какое напоминание отменить? 🤔", messageId, threadId);
+    return;
+  }
+
+  const found = await findReminderByDescription(env, chatId, searchText);
+  if (found) {
+    await import("./reminders").then((m) => m.deleteReminder(env, chatId, found.id));
+    await sendMessage(env, chatId, `Ок, отменила напоминание "${found.description}" ✅`, messageId, threadId);
+  } else {
+    await sendMessage(env, chatId, `Не нашла такое напоминание 🤷‍♀️`, messageId, threadId);
+  }
+}
+
+// ─── Command Extraction ──────────────────────────────────────────────────────
 
 function extractCommand(text: string): { name: string; args: string } | null {
   if (!text.startsWith("/")) return null;
@@ -214,372 +597,78 @@ function extractCommand(text: string): { name: string; args: string } | null {
   };
 }
 
-// ─── Intent Detection (keyword-only, NO LLM) ───────────────────────────────
+// ─── Cron Handler ────────────────────────────────────────────────────────────
 
-const SEARCH_KEYWORDS = [
-  "найди", "поищи", "загугли", "что такое", "кто такой",
-  "расскажи про", "search", "гугл",
-];
+async function handleCron(env: Env): Promise<void> {
+  const chatIds = await getActiveChats(env);
 
-const FACT_KEYWORDS = [
-  "правда ли", "правда что", "это правда", "верно ли",
-  "проверь факт", "фактчек",
-  "проверь так", "так ли это", "это так", "это верно", "это точно",
-  "проверь это", "правда ли это", "на факты", "проверь на",
-  "так ли", "точно ли", "верно что",
-];
+  for (const chatId of chatIds) {
+    // 1. Drift mood + volatility
+    await cronMoodShift(env, chatId);
 
-function detectIntent(text: string): "search" | "fact" | "chat" {
-  const lower = text.toLowerCase();
-
-  for (const kw of FACT_KEYWORDS) {
-    if (lower.includes(kw)) return "fact";
-  }
-
-  for (const kw of SEARCH_KEYWORDS) {
-    if (lower.includes(kw)) return "search";
-  }
-
-  return "chat";
-}
-
-// ─── Handle Fact Check ──────────────────────────────────────────────────────
-
-async function handleFact(
-  env: Env,
-  ctx: ExecutionContext,
-  chatId: number,
-  messageId: number,
-  userId: number,
-  claim: string,
-  message: TelegramMessage,
-  threadId?: number,
-): Promise<void> {
-  // If no args but replying to a message, use that
-  let factText = claim;
-  if (!factText && message.reply_to_message?.text) {
-    factText = message.reply_to_message.text;
-  }
-
-  if (!factText) {
-    await sendMessage(env, chatId, "Напиши факт для проверки после /fact", messageId, threadId);
-    return;
-  }
-
-  // Optimize long/conversational claims before searching
-  const searchQuery = factText.length > 30
-    ? await optimizeSearchQuery(env, factText, chatId)
-    : factText;
-
-  // Search for evidence
-  const searchResult = await searchWeb(env, searchQuery);
-  const context = searchResult?.context ?? "Не удалось найти информацию в интернете.";
-
-  const prompt = `Пользователь задал вопрос/факт в чате. Используя найденную ниже справку, ответь ему четко, живо и по-пацански (без занудства "по результатам поиска"). Оцени достоверность:\n\nВопрос/Факт: ${factText}`;
-
-  const response = await chatWithContext(env, prompt, context, userId, chatId);
-
-  if (response) {
-    const sourcesFooter = searchResult ? formatSources(searchResult.sources) : "";
-    const fullResponse = formatForTelegram(response) + sourcesFooter;
-    const sent = await sendMessage(env, chatId, fullResponse, messageId, threadId);
-    if (sent) ctx.waitUntil(saveBotMessage(env, chatId, response));
-  } else {
-    await handleProviderFailure(env, chatId, messageId, userId, factText, "fact", threadId);
-  }
-}
-
-// ─── Handle Search ──────────────────────────────────────────────────────────
-
-async function handleSearch(
-  env: Env,
-  ctx: ExecutionContext,
-  chatId: number,
-  messageId: number,
-  userId: number,
-  query: string,
-  message: TelegramMessage,
-  threadId?: number,
-): Promise<void> {
-  let searchQuery = query;
-
-  // If replying to a message, use that as query
-  if (!searchQuery && message.reply_to_message?.text) {
-    searchQuery = message.reply_to_message.text;
-  }
-
-  // If still no query, generate from chat context
-  if (!searchQuery) {
-    const generated = await generateSearchQuery(env, chatId);
-    if (!generated) {
-      await sendMessage(env, chatId, "Напиши что искать после /search", messageId, threadId);
-      return;
-    }
-    searchQuery = generated;
-  }
-
-  // Optimize conversational/long queries before hitting Tavily
-  const effectiveQuery = searchQuery.length > 30
-    ? await optimizeSearchQuery(env, searchQuery, chatId)
-    : searchQuery;
-
-  const searchResult = await searchWeb(env, effectiveQuery);
-
-  if (!searchResult) {
-    await sendMessage(env, chatId, "Ничего не нашел по этому запросу", messageId, threadId);
-    return;
-  }
-
-  const response = await chatWithContext(
-    env,
-    `Используя найденную ниже информацию (поисковый запрос "${effectiveQuery}"), расскажи ответ живо, кратко и с уместным сарказмом. Ни в коем случае не пиши скучно или как робот.`,
-    searchResult.context,
-    userId,
-    chatId,
-  );
-
-  if (response) {
-    const sourcesFooter = formatSources(searchResult.sources);
-    const fullResponse = formatForTelegram(response) + sourcesFooter;
-    const sent = await sendMessage(env, chatId, fullResponse, messageId, threadId);
-    if (sent) ctx.waitUntil(saveBotMessage(env, chatId, response));
-  } else {
-    await handleProviderFailure(env, chatId, messageId, userId, searchQuery, "search", threadId);
-  }
-}
-
-// ─── Handle Weather ─────────────────────────────────────────────────────────
-
-async function handleWeather(
-  env: Env,
-  ctx: ExecutionContext,
-  chatId: number,
-  messageId?: number,
-  threadId?: number,
-): Promise<void> {
-  const weatherText = await fetchWeather(env);
-
-  // Send raw weather data
-  await sendMessage(env, chatId, formatForTelegram(weatherText), messageId, threadId);
-
-  // Generate and send comment
-  const comment = await generateWeatherComment(env, weatherText);
-  if (comment) {
-    const sent = await sendMessage(env, chatId, formatForTelegram(comment), undefined, threadId);
-    if (sent) ctx.waitUntil(saveBotMessage(env, chatId, comment));
-  }
-}
-
-// ─── Handle Help ────────────────────────────────────────────────────────────
-
-async function handleHelp(
-  env: Env,
-  chatId: number,
-  messageId: number,
-  threadId?: number,
-): Promise<void> {
-  const helpText = `Доступные команды:
-
-/search (или /найди) — поиск в интернете
-/fact (или /факт) — проверка фактов
-/weather (или /погода) — погода в Алматы
-/help (или /помощь) — эта справка
-
-Также можно просто написать "Амоня, найди..." или "Амоня, проверь..."`;
-
-  await sendMessage(env, chatId, helpText, messageId, threadId);
-}
-
-// ─── Handle Reply to Message ────────────────────────────────────────────────
-
-async function handleReply(
-  env: Env,
-  ctx: ExecutionContext,
-  chatId: number,
-  messageId: number,
-  userId: number,
-  text: string,
-  message: TelegramMessage,
-  threadId?: number,
-): Promise<void> {
-  const repliedText = message.reply_to_message!.text || message.reply_to_message!.caption || "";
-
-  // Build context from forwarded message
-  let forwardContext = "";
-  if (message.reply_to_message!.forward_from_chat) {
-    const channelTitle = message.reply_to_message!.forward_from_chat.title ?? "неизвестный канал";
-    forwardContext = `пересланный пост из канала "${channelTitle}"`;
-  } else if (message.reply_to_message!.forward_sender_name) {
-    forwardContext = `пересланное сообщение от ${message.reply_to_message!.forward_sender_name}`;
-  } else if (message.reply_to_message!.forward_from) {
-    forwardContext = `пересланное сообщение от ${message.reply_to_message!.forward_from.first_name}`;
-  } else {
-    forwardContext = `сообщение`;
-  }
-
-  let intent = detectIntent(text);
-
-  // If no keyword match, use LLM classification for longer messages
-  if (intent === "chat" && text.length > 8) {
-    intent = await llmDetectIntent(env, text);
-  }
-
-  if (intent === "fact") {
-    await handleFact(env, ctx, chatId, messageId, userId, repliedText, message, threadId);
-    return;
-  }
-
-  if (intent === "search") {
-    await handleSearch(env, ctx, chatId, messageId, userId, repliedText, message, threadId);
-    return;
-  }
-
-  // Chat with reply context
-  const combinedText = `[Я переслал тебе ${forwardContext} с текстом:\n"${repliedText}"]\n\nМой вопрос/комментарий к этому: ${text}`;
-  const response = await chat(env, combinedText, userId, chatId);
-
-  if (response) {
-    const sent = await sendMessage(env, chatId, formatForTelegram(response), messageId, threadId);
-    if (sent) ctx.waitUntil(saveBotMessage(env, chatId, response));
-  } else {
-    await handleProviderFailure(env, chatId, messageId, userId, text, "chat", threadId);
-  }
-}
-
-// ─── Spontaneous Reactions ──────────────────────────────────────────────────
-
-async function handleSpontaneous(
-  env: Env,
-  chatId: number,
-  messageId: number,
-  text: string,
-  userId: number,
-): Promise<void> {
-  const roll = Math.random() * 100;
-
-  if (roll < 12) {
-    // 12% chance: react with emoji
-    await setMessageReaction(env, chatId, messageId);
-  } else if (roll < 15) {
-    // 3% chance (12-15% range): spontaneous comment
-    const comment = await generateSpontaneousComment(env, text, userId, chatId);
-    if (comment) {
-      await sendMessage(env, chatId, formatForTelegram(comment), messageId, undefined);
-      await saveBotMessage(env, chatId, comment);
-    }
-  }
-}
-
-// ─── Provider Failure Handling ──────────────────────────────────────────────
-
-async function handleProviderFailure(
-  env: Env,
-  chatId: number,
-  messageId: number,
-  userId: number,
-  text: string,
-  intent: string,
-  threadId?: number,
-): Promise<void> {
-  // Save retry task
-  const retryTask: RetryTask = {
-    chatId,
-    messageId,
-    userId,
-    text,
-    intent,
-    threadId,
-    attempt: 1,
-  };
-
-  const retryKey = `retry_task:${chatId}:${Date.now()}`;
-  await env.KV.put(retryKey, JSON.stringify(retryTask), { expirationTtl: 300 }); // 5 min TTL
-
-  await sendMessage(env, chatId, "⏳ Серверы перегружены, отвечу через минутку", messageId, threadId);
-}
-
-// ─── Daily Weather Cron ─────────────────────────────────────────────────────
-
-async function handleDailyWeather(env: Env): Promise<void> {
-  const chatId = parseInt(env.TELEGRAM_CHAT_ID, 10);
-  if (!chatId || isNaN(chatId)) {
-    console.error("Invalid TELEGRAM_CHAT_ID");
-    return;
-  }
-
-  // Route to specific topic if thread ID is provided
-  const threadId = env.WEATHER_THREAD_ID ? parseInt(env.WEATHER_THREAD_ID, 10) : undefined;
-
-  await handleWeather(env, { waitUntil: () => {} } as unknown as ExecutionContext, chatId, undefined, threadId);
-}
-
-// ─── Process Retry Queue ───────────────────────────────────────────────────
-
-async function processRetryQueue(env: Env): Promise<void> {
-  try {
-    const list = await env.KV.list({ prefix: "retry_task:" });
-
-    if (list.keys.length === 0) return;
-
-    // Process first retry task only
-    const firstKey = list.keys[0];
-    const raw = await env.KV.get(firstKey.name);
-    if (!raw) return;
-
-    const task = JSON.parse(raw) as RetryTask;
-
-    // Delete the task immediately to prevent double-processing
-    await env.KV.delete(firstKey.name);
-
-    let response: string | null = null;
-
-    switch (task.intent) {
-      case "fact": {
-        const searchResult = await searchWeb(env, task.text);
-        const context = searchResult?.context ?? "Не удалось найти информацию.";
-        response = await chatWithContext(
-          env,
-          `Проверь факт: ${task.text}`,
-          context,
-          task.userId,
-          task.chatId,
-        );
-        break;
-      }
-
-      case "search": {
-        const searchResult = await searchWeb(env, task.text);
-        if (searchResult) {
-          response = await chatWithContext(
-            env,
-            `Суммаризуй: ${task.text}`,
-            searchResult.context,
-            task.userId,
-            task.chatId,
-          );
+    // 2. Check pending follow-ups
+    const followUp = await checkPendingFollowUp(env, chatId);
+    if (followUp.shouldSend && followUp.topicSnapshot) {
+      const mood = await getMood(env, chatId);
+      // Build a generic system prompt for proactive message
+      const profile = await getProfile(env, chatId, 0);
+      const systemPrompt = buildSystemPrompt(mood, profile, "", "group", chatId);
+      const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
+      if (response) {
+        const { cleanText } = extractStickerTag(response);
+        if (cleanText) {
+          await sendMessage(env, chatId, formatForTelegram(cleanText));
+          await saveBotMessage(env, chatId, cleanText);
+          await markProactiveSent(env, chatId);
         }
-        break;
-      }
-
-      default: {
-        response = await chat(env, task.text, task.userId, task.chatId);
-        break;
       }
     }
 
-    if (response) {
-      await sendMessage(env, task.chatId, formatForTelegram(response), task.messageId, task.threadId);
-      await saveBotMessage(env, task.chatId, response);
-    } else {
-      await sendMessage(
+    // 3. Random proactive message (suppress at night 00:00-07:00 Almaty)
+    const almatyHour = (new Date().getUTCHours() + 5) % 24;
+    const isNight = almatyHour >= 0 && almatyHour < 7;
+    const isPrivate = chatId > 0; // Telegram: positive IDs = private, negative = group
+    if (!isNight && await shouldSendProactive(env, chatId, isPrivate)) {
+      const mood = await getMood(env, chatId);
+      const profile = await getProfile(env, chatId, 0);
+      const chatType = isPrivate ? "private" : "supergroup";
+      const systemPrompt = buildSystemPrompt(mood, profile, "", chatType, chatId);
+      const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
+      if (response) {
+        const { cleanText, emotion } = extractStickerTag(response);
+        if (cleanText) {
+          await sendMessage(env, chatId, formatForTelegram(cleanText));
+          await saveBotMessage(env, chatId, cleanText);
+        }
+        if (emotion && chatId === VIP_GROUP_ID) {
+          const sticker = pickStickerForMood(emotion as any);
+          if (sticker) await sendSticker(env, chatId, sticker.fileId);
+        }
+        await markProactiveSent(env, chatId);
+      }
+    }
+
+    // 4. Check due reminders
+    const dueReminders = await getDueReminders(env, [chatId]);
+    for (const reminder of dueReminders) {
+      const mood = await getMood(env, chatId);
+      const profile = await getProfile(env, chatId, reminder.userId);
+      const userName = await resolveUserName(env, chatId, reminder.userId);
+      const chatType = chatId > 0 ? "private" : "supergroup";
+      const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId);
+
+      const response = await chat(
         env,
-        task.chatId,
-        "Серверы все ещё недоступны, попробуйте позже",
-        task.messageId,
-        task.threadId,
+        `[НАПОМИНАНИЕ для ${userName}: "${reminder.description}"]. Напомни в своём стиле, обращаясь к ${userName}.`,
+        userName, systemPrompt, chatId,
       );
+
+      if (response) {
+        await sendMessage(env, chatId, formatForTelegram(response));
+        await saveBotMessage(env, chatId, response);
+      }
+
+      await processReminder(env, reminder);
     }
-  } catch (err) {
-    console.error("Retry queue processing error:", err);
   }
 }

@@ -1,6 +1,6 @@
 // ─── Telegram API Helpers ────────────────────────────────────────────────────
 
-import type { Env, TelegramUpdate, TelegramMessage } from "./config";
+import type { Env, TelegramUpdate, TelegramMessage, MoodState } from "./config";
 
 const TELEGRAM_API = "https://api.telegram.org/bot";
 
@@ -79,19 +79,96 @@ export async function sendMessage(
   }
 }
 
+// ─── Send Sticker ────────────────────────────────────────────────────────────
+
+export async function sendSticker(
+  env: Env,
+  chatId: number,
+  stickerFileId: string,
+  replyToMessageId?: number,
+  messageThreadId?: number,
+): Promise<TelegramMessage | null> {
+  const url = `${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/sendSticker`;
+
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    sticker: stickerFileId,
+  };
+
+  if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
+  if (messageThreadId) body.message_thread_id = messageThreadId;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      console.error("sendSticker failed:", await res.text());
+      return null;
+    }
+
+    const data = await res.json() as { result: TelegramMessage };
+    return data.result;
+  } catch (err) {
+    console.error("sendSticker error:", err);
+    return null;
+  }
+}
+
+// ─── Send Chat Action (typing simulation) ────────────────────────────────────
+
+export async function sendChatAction(
+  env: Env,
+  chatId: number,
+  action: "typing" | "upload_photo" | "upload_document" = "typing",
+  messageThreadId?: number,
+): Promise<void> {
+  const url = `${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/sendChatAction`;
+
+  try {
+    await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        action,
+        ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+      }),
+    });
+  } catch {
+    // Best-effort, ignore errors
+  }
+}
+
 // ─── Set Reaction ────────────────────────────────────────────────────────────
 
-const REACTION_EMOJIS = [
-  "👍", "❤", "🔥", "😂", "🤔", "👀", "💯", "🤣",
-  "😎", "🫡", "👏", "🤝", "😢", "🎉", "🤯",
-];
+// Mood-influenced emoji pools
+const EMOJI_BY_MOOD: Record<string, string[]> = {
+  happy:    ["�", "❤", "🔥", "�", "🎉", "👏", "💯"],
+  playful:  ["��", "�", "�", "��", "🤭", "�", "�"],
+  chill:    ["�", "😌", "🤙", "💫", "✨"],
+  flirty:   ["😏", "🥰", "💋", "💕", "❤", "😘", "�"],
+  annoyed:  ["😒", "🙄", "😤", "�", "�"],
+  offended: ["😢", "💔", "😐", "🥀"],
+  mean:     ["💀", "🙄", "😈", "🤡", "🫠"],
+  serious:  ["🤔", "👀", "🧐", "📌"],
+  unhinged: ["🤯", "😵‍💫", "🫣", "💀", "🤪", "👹"],
+  manic:    ["🔥", "⚡", "🤩", "🚀", "💥", "🤯"],
+};
+
+const DEFAULT_EMOJIS = ["👍", "❤", "🔥", "😂", "🤔", "👀"];
 
 export async function setMessageReaction(
   env: Env,
   chatId: number,
   messageId: number,
+  mood?: MoodState,
 ): Promise<void> {
-  const emoji = REACTION_EMOJIS[Math.floor(Math.random() * REACTION_EMOJIS.length)];
+  const pool = (mood && EMOJI_BY_MOOD[mood]) || DEFAULT_EMOJIS;
+  const emoji = pool[Math.floor(Math.random() * pool.length)];
   const url = `${TELEGRAM_API}${env.TELEGRAM_BOT_TOKEN}/setMessageReaction`;
 
   try {
