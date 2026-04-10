@@ -416,12 +416,17 @@ async function sendAndSave(
     if (sent) ctx.waitUntil(saveBotMessage(env, chatId, parts[i]));
   }
 
-  // Send sticker if tagged and in VIP group
+  // Send sticker if tagged (works in VIP group; sticker-only = no text parts)
   if (emotion && chatId === VIP_GROUP_ID) {
     const sticker = pickStickerForMood(emotion as any);
     if (sticker) {
       await sendSticker(env, chatId, sticker.fileId, undefined, threadId);
     }
+  }
+
+  // If no text and no sticker was sent, fall back to reaction
+  if (parts.length === 0 && !emotion) {
+    await setMessageReaction(env, chatId, messageId || 0, mood?.mood);
   }
 }
 
