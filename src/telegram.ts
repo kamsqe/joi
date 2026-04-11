@@ -262,6 +262,16 @@ export function splitMessage(text: string): string[] {
 export function sanitizeResponse(text: string): string {
   let result = text;
 
+  // Strip thinking artifacts that leak into response
+  // Pattern 1: "*Wait, ...", "*Thinking...", "*Let me...", etc.
+  result = result.replace(/\s*\*(?:Wait|Thinking|Let me|I need|I should|Hmm|Ok |The prompt|The user|Ask |Suggest|Note)[^]*$/i, "");
+  // Pattern 2: Internal formatting like "Music/Food):* Ask about..."
+  result = result.replace(/\s*[\w\/\)]+\):\*\s*[^]*$/i, "");
+  // Pattern 3: Entire response is thinking artifact (no Cyrillic at all)
+  if (result.length > 0 && !/[а-яёА-ЯЁ]/.test(result)) {
+    result = "";
+  }
+
   // Remove CJK characters (Chinese/Japanese/Korean ideographs)
   result = result.replace(/[\u4E00-\u9FFF\u3400-\u4DBF\u3000-\u303F\u3040-\u309F\u30A0-\u30FF\uFF00-\uFFEF]/g, "");
 

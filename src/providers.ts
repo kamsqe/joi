@@ -77,6 +77,13 @@ export async function callGemini(
       maxOutputTokens: maxTokens,
       temperature,
     },
+    safetySettings: [
+      { category: "HARM_CATEGORY_HARASSMENT", threshold: "OFF" },
+      { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "OFF" },
+      { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "OFF" },
+      { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "OFF" },
+      { category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "OFF" },
+    ],
   };
 
   try {
@@ -92,10 +99,24 @@ export async function callGemini(
     }
 
     const data = await res.json() as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      candidates?: Array<{
+        content?: { parts?: Array<{ text?: string }> };
+        finishReason?: string;
+      }>;
+      usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number };
     };
 
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text ?? null;
+    const candidate = data?.candidates?.[0];
+    // With thinking enabled, parts = [{thought:true, text:"..."}, {text:"response"}]
+    // Pick the last non-thought part
+    const parts = candidate?.content?.parts || [];
+    const responsePart = parts.filter((p: any) => !p.thought).pop();
+    const text = responsePart?.text ?? null;
+
+    // Diagnostic logging
+    console.log(`[Gemini] model=${model} finish=${candidate?.finishReason} tokens=${data?.usageMetadata?.candidatesTokenCount}/${data?.usageMetadata?.totalTokenCount} textLen=${text?.length ?? 0}`);
+
+    return text;
   } catch (err) {
     console.error("Gemini context error:", err);
     return null;

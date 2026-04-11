@@ -2,7 +2,7 @@
 
 import type { Env, LLMMessage, MoodData, UserProfile, MoodState } from "./config";
 import { VIP_GROUP_ID, VIP_MEMBERS, AMONYA_USERNAME, RUSTEM_USER_ID } from "./config";
-import { callWorkersAI, callGemini } from "./providers";
+import { callGemini } from "./providers";
 import { getBuffer, buildLLMHistory } from "./context";
 import { sanitizeResponse } from "./telegram";
 import { buildRelationshipSummary } from "./relationships";
@@ -424,7 +424,7 @@ export async function callLLMChat(
   chatId: number,
   messages: LLMMessage[],
   systemPrompt: string,
-  maxTokens: number = 512,
+  maxTokens: number = 4096,
   temperature: number = 0.75,
 ): Promise<string | null> {
   // Pick API key based on chat
@@ -432,8 +432,7 @@ export async function callLLMChat(
     ? env.GEMINI_API_VIP_GROUP_KEY
     : env.GEMINI_API_TELEGRAM_JOI;
 
-  // 1. Try Gemini Flash
-  const geminiResult = await callGemini(
+  const result = await callGemini(
     apiKey,
     messages,
     systemPrompt,
@@ -441,17 +440,8 @@ export async function callLLMChat(
     temperature,
     CHAT_MODEL,
   );
-  if (geminiResult) return sanitizeResponse(geminiResult);
 
-  // 2. Fallback to Workers AI
-  try {
-    const workersResult = await callWorkersAI(env, messages, systemPrompt, maxTokens, temperature);
-    if (workersResult) return sanitizeResponse(workersResult);
-  } catch (err) {
-    console.error("Workers AI failed:", err);
-  }
-
-  return null;
+  return result ? sanitizeResponse(result) : null;
 }
 
 // ─── Call LLM (Light — Flash-Lite for background tasks) ─────────────────────
@@ -486,12 +476,18 @@ export async function chat(
   const buffer = await getBuffer(env, chatId);
   const history = buildLLMHistory(buffer);
 
-  const messages: LLMMessage[] = [
-    ...history,
-    { role: "user", content: `[${userName}]: ${text}` },
-  ];
+  const userContent = userName ? `[${userName}]: ${text}` : text;
 
-  return callLLMChat(env, chatId, messages, systemPrompt, 600, 0.8);
+  // Avoid duplicate: buffer may already contain this message due to race condition
+  // (saveUserMessage via waitUntil completes before this read)
+  const lastMsg = history[history.length - 1];
+  const isDuplicate = lastMsg?.role === "user" && lastMsg.content === userContent;
+
+  const messages: LLMMessage[] = isDuplicate
+    ? history
+    : [...history, { role: "user", content: userContent }];
+
+  return callLLMChat(env, chatId, messages, systemPrompt, 4096, 0.8);
 }
 
 // ─── Classify Sentiment Toward Joi ───────────────────────────────────────────
@@ -651,5 +647,5 @@ export async function generateProactiveMessage(
 
   const messages: LLMMessage[] = [{ role: "user", content: proactivePrompt }];
 
-  return callLLMChat(env, chatId, messages, systemPrompt, 256, 0.9);
+  return callLLMChat(env, chatId, messages, systemPrompt, 4096, 0.9);
 }

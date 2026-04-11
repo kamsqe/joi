@@ -475,8 +475,7 @@ async function sendAndSave(
   // Split by --- separator (LLM-generated message splits)
   const parts = cleanText.split(/\n?---\n?/).map((p) => p.trim()).filter((p) => p.length > 0);
 
-  // Send each part as a separate message, chaining replies to stay in topic
-  let lastSentId = messageId;
+  // Send each part as a separate message, all replying to the original user message
   for (let i = 0; i < parts.length; i++) {
     const formatted = formatForTelegram(parts[i]);
 
@@ -489,11 +488,10 @@ async function sendAndSave(
 
     const sent = await sendMessage(
       env, chatId, formatted,
-      lastSentId,
+      i === 0 ? messageId : undefined,
       threadId,
     );
     if (sent) {
-      lastSentId = sent.message_id;
       ctx.waitUntil(saveBotMessage(env, chatId, parts[i]));
     }
   }
@@ -726,9 +724,11 @@ async function handleCron(env: Env): Promise<void> {
     const followUp = await checkPendingFollowUp(env, chatId);
     if (followUp.shouldSend && followUp.topicSnapshot) {
       const mood = await getMood(env, chatId);
-      // Build a generic system prompt for proactive message
-      const profile = await getProfile(env, chatId, 0);
-      const systemPrompt = buildSystemPrompt(mood, profile, "", "group", chatId);
+      const isPrivateChat = chatId > 0;
+      const followUpUserId = isPrivateChat ? chatId : 0;
+      const profile = await getProfile(env, chatId, followUpUserId);
+      const chatType = isPrivateChat ? "private" : "supergroup";
+      const systemPrompt = buildSystemPrompt(mood, profile, profile.nickname || "", chatType as any, chatId);
       const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
       if (response) {
         const { cleanText } = extractStickerTag(response);
@@ -746,9 +746,11 @@ async function handleCron(env: Env): Promise<void> {
     const isPrivate = chatId > 0; // Telegram: positive IDs = private, negative = group
     if (!isNight && await shouldSendProactive(env, chatId, isPrivate)) {
       const mood = await getMood(env, chatId);
-      const profile = await getProfile(env, chatId, 0);
+      const proactiveUserId = isPrivate ? chatId : 0;
+      const profile = await getProfile(env, chatId, proactiveUserId);
       const chatType = isPrivate ? "private" : "supergroup";
-      const systemPrompt = buildSystemPrompt(mood, profile, "", chatType, chatId);
+      const facts = isPrivate ? await getFacts(env, chatId, proactiveUserId) : [];
+      const systemPrompt = buildSystemPrompt(mood, profile, profile.nickname || "", chatType, chatId, { facts });
       const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
       if (response) {
         const { cleanText, emotion } = extractStickerTag(response);
