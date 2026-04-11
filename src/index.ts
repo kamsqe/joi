@@ -1,18 +1,19 @@
 // ─── Joi Bot — Main Entry Point ─────────────────────────────────────────────
 
 import type { Env, TelegramMessage } from "./config";
-import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID, VIP_PROACTIVE_TOPIC_ID } from "./config";
+import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID, VIP_PROACTIVE_TOPIC_ID, RUSTEM_USER_ID } from "./config";
 import { parseUpdate, sendMessage, sendSticker, sendChatAction, setMessageReaction, formatForTelegram } from "./telegram";
 import { resolveUserName, registerActiveChat, getActiveChats, isFirstContact, isThirdPartyNicknameRequest } from "./users";
 import { saveUserMessage, saveBotMessage } from "./context";
 import { buildSystemPrompt, chat, classifySentiment, detectNicknameRequest, detectReminderIntent, generateProactiveMessage } from "./ai";
 import { getMood, maybeSwingMood, shiftMoodBySentiment, setOffended, clearOffense, cronMoodShift } from "./mood";
-import { getProfile, adjustScore, setNickname, markFirstContactDone } from "./relationships";
-import { checkRateLimit, RATE_LIMIT_MESSAGE, checkRPMThrottle, trackLLMCall, enterBlackout, getBlackoutState } from "./rate-limit";
+import { getProfile, saveProfile, adjustScore, setNickname, markFirstContactDone } from "./relationships";
+import { checkRateLimit, checkRPMThrottle, trackLLMCall, enterBlackout, getBlackoutState } from "./rate-limit";
 import type { ThrottleLevel } from "./rate-limit";
 import { shouldSendProactive, markProactiveSent, checkPendingFollowUp, scheduleFollowUp } from "./proactive";
 import { createReminder, getChatReminders, getDueReminders, processReminder, parseRelativeTime, computeReminderDates, findReminderByDescription } from "./reminders";
 import { pickStickerForMood, extractStickerTag } from "./stickers";
+import { getFacts, extractAndSaveFacts } from "./facts";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
 
@@ -72,7 +73,13 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
   // Rate limit check (before any LLM calls)
   const { allowed } = await checkRateLimit(env, chatId);
   if (!allowed) {
-    await sendMessage(env, chatId, RATE_LIMIT_MESSAGE, messageId, threadId);
+    const rateLimitResponses = [
+      "всё, на сегодня я всё 💅 пиши @kamsqe если хочешь безлимит",
+      "лимит на сегодня) напиши @kamsqe если что",
+      "я устала на сегодня, сорри. @kamsqe для безлимита",
+    ];
+    const pick = rateLimitResponses[Math.floor(Math.random() * rateLimitResponses.length)];
+    await sendMessage(env, chatId, pick, messageId, threadId);
     return;
   }
 
@@ -86,6 +93,11 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
 
   // Save message to buffer
   if (bufferText) ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText));
+
+  // Extract facts from user message (non-blocking, background)
+  if (text && text.length >= 10) {
+    ctx.waitUntil(extractAndSaveFacts(env, chatId, userId, text));
+  }
 
   // Determine if bot should respond
   const shouldReply = isPrivate || shouldRespondInGroup(message, text);
@@ -143,12 +155,25 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
   const effectiveText = text || (hasMedia ? describeMedia(message) : "");
   if (!effectiveText) return;
 
+  // ─── Rustem Mode (VIP group only) ────────────────────────────────────────
+  if (userId === RUSTEM_USER_ID && chatId === VIP_GROUP_ID) {
+    const rustemResult = await handleRustemMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, throttle);
+    if (rustemResult) return; // handled (skipped or passive-aggressive reply sent)
+  }
+
   // Active response path
   try {
     await handleActiveMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, isPrivate, throttle);
   } catch (err) {
     console.error("Message handling error:", err);
-    await sendMessage(env, chatId, "Что-то пошло не так... 😅", messageId, threadId);
+    const errorResponses = [
+      "блин, мысль потеряла",
+      "чёт я зависла, повтори",
+      "секунду... а нет, забей, повтори ещё раз",
+      "ой ну блин, что-то я туплю. повтори",
+    ];
+    const pick = errorResponses[Math.floor(Math.random() * errorResponses.length)];
+    await sendMessage(env, chatId, pick, messageId, threadId);
   }
 }
 
@@ -258,6 +283,11 @@ async function handleActiveMessage(
   const mood = await maybeSwingMood(env, chatId);
   const profile = await getProfile(env, chatId, userId);
 
+  // Track activity hour for time patterns
+  const currentHour = new Date().getUTCHours();
+  profile.activityHours = [...(profile.activityHours || []).slice(-19), currentHour];
+  ctx.waitUntil(saveProfile(env, profile));
+
   // Check blackout recovery
   const blackout = await getBlackoutState(env, chatId);
   let missedMessages = 0;
@@ -320,6 +350,23 @@ async function handleActiveMessage(
     return;
   }
 
+  // ─── Auto Name Capture (after first contact asked "как тебя зовут?") ─────
+  if (isPrivate && !profile.nickname && !profile.nicknameOverride && text.length < 30 && !text.startsWith("/")) {
+    const possibleName = text.trim()
+      .replace(/^меня зовут\s*/i, "")
+      .replace(/^я\s+/i, "")
+      .replace(/^зови меня\s*/i, "")
+      .replace(/[.!?,)(\s]+$/g, "")
+      .trim();
+    if (possibleName.length >= 2 && possibleName.length <= 20 && !possibleName.includes(" ")) {
+      await setNickname(env, chatId, userId, possibleName);
+      const systemPrompt = buildSystemPrompt(mood, profile, possibleName, chatType as any, chatId);
+      const response = await chat(env, `[Новый знакомый представился: "${possibleName}"]. Приветливо поздоровайся, используй имя, скажи что-нибудь приятное. Будь тёплой и дружелюбной.`, possibleName, systemPrompt, chatId);
+      if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
+      return;
+    }
+  }
+
   // ─── Nickname Change Detection ───────────────────────────────────────────
 
   // Check if someone is trying to change someone ELSE's nickname (VIP only)
@@ -365,7 +412,8 @@ async function handleActiveMessage(
 
   // ─── Default: Chat ───────────────────────────────────────────────────────
 
-  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages });
+  const facts = await getFacts(env, chatId, userId);
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts });
 
   // Send "typing" indicator before LLM call
   await sendChatAction(env, chatId, "typing", threadId);
@@ -383,7 +431,13 @@ async function handleActiveMessage(
   if (response) {
     await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
   } else {
-    await sendMessage(env, chatId, "Не могу сейчас ответить... попробуй позже 😔", messageId, threadId);
+    const fallbackResponses = [
+      "хмм не могу сейчас сообразить, повтори попозже",
+      "ой чёт я туплю, напиши ещё раз",
+      "аа блин, мысль убежала. позже повтори",
+    ];
+    const pick = fallbackResponses[Math.floor(Math.random() * fallbackResponses.length)];
+    await sendMessage(env, chatId, pick, messageId, threadId);
   }
 }
 
@@ -733,6 +787,105 @@ async function handleCron(env: Env): Promise<void> {
       await processReminder(env, reminder);
     }
   }
+}
+
+// ─── Rustem Mode ────────────────────────────────────────────────────────────
+// Mostly ignore Rustem in VIP group. Occasionally send passive-aggressive replies.
+// Track apologies — gradual forgiveness over time.
+
+const RUSTEM_PASSIVE_RESPONSES = [
+  ")", "👍", "ок", "мхм", "ну ладно", "ага", "угу", "ну-ну", "...",
+  "Ок.", "Хорошо.", "Понятно.",
+];
+
+const APOLOGY_KEYWORDS = [
+  "прости", "извини", "сорри", "sorry", "мой косяк", "я был неправ",
+  "не хотел", "прошу прощения", "виноват", "пардон",
+];
+
+async function getRustemApologyState(env: Env): Promise<{ count: number; firstAt: number; lastAt: number }> {
+  const key = `rustem_apologies:${VIP_GROUP_ID}`;
+  try {
+    const raw = await env.KV.get(key);
+    if (raw) return JSON.parse(raw);
+  } catch { /* fall through */ }
+  return { count: 0, firstAt: 0, lastAt: 0 };
+}
+
+async function trackRustemApology(env: Env): Promise<void> {
+  const key = `rustem_apologies:${VIP_GROUP_ID}`;
+  const state = await getRustemApologyState(env);
+  state.count += 1;
+  if (state.firstAt === 0) state.firstAt = Date.now();
+  state.lastAt = Date.now();
+  await env.KV.put(key, JSON.stringify(state), { expirationTtl: 60 * 60 * 24 * 30 }); // 30 days
+}
+
+async function resetRustemApologies(env: Env): Promise<void> {
+  await env.KV.delete(`rustem_apologies:${VIP_GROUP_ID}`);
+}
+
+function isRustemApology(text: string): boolean {
+  const lower = text.toLowerCase();
+  return APOLOGY_KEYWORDS.some((kw) => lower.includes(kw));
+}
+
+async function handleRustemMessage(
+  env: Env,
+  ctx: ExecutionContext,
+  chatId: number,
+  chatType: string,
+  messageId: number,
+  userId: number,
+  userName: string,
+  text: string,
+  message: TelegramMessage,
+  threadId?: number,
+  throttle: ThrottleLevel = "normal",
+): Promise<boolean> {
+  // Track apologies
+  if (isRustemApology(text)) {
+    ctx.waitUntil(trackRustemApology(env));
+  }
+
+  // Calculate response chance based on apology state
+  const apologyState = await getRustemApologyState(env);
+  const daysSinceFirst = apologyState.firstAt > 0
+    ? (Date.now() - apologyState.firstAt) / (1000 * 60 * 60 * 24)
+    : 0;
+
+  // Base: 5% chance to respond. +5% per apology (max +45%), but only if apologies span 3+ days
+  let responseChance = 0.05;
+  if (apologyState.count >= 1 && daysSinceFirst >= 3) {
+    responseChance += Math.min(apologyState.count * 0.05, 0.45);
+  }
+
+  // If he just apologized right now, slightly boost chance for this message
+  if (isRustemApology(text)) {
+    responseChance = Math.max(responseChance, 0.30);
+  }
+
+  const roll = Math.random();
+
+  if (roll > responseChance) {
+    // Ignore — but sometimes react with an emoji
+    if (Math.random() < 0.08) {
+      await setMessageReaction(env, chatId, messageId, "annoyed");
+    }
+    return true; // handled (skipped)
+  }
+
+  // Decide: passive-aggressive one-liner (75%) or full LLM response (25%)
+  if (Math.random() < 0.75) {
+    const pick = RUSTEM_PASSIVE_RESPONSES[Math.floor(Math.random() * RUSTEM_PASSIVE_RESPONSES.length)];
+    await sendMessage(env, chatId, pick, messageId, threadId);
+    ctx.waitUntil(saveBotMessage(env, chatId, pick));
+    return true;
+  }
+
+  // Full LLM response — but with cold/hostile tone enforced
+  // Let it fall through to handleActiveMessage with normal flow
+  return false;
 }
 
 // ─── Troll Cooldown Helpers ──────────────────────────────────────────────────

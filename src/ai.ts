@@ -1,7 +1,7 @@
 // ─── AI Layer: Modular System Prompt, Chat, Sentiment ─────────────────────────
 
 import type { Env, LLMMessage, MoodData, UserProfile, MoodState } from "./config";
-import { VIP_GROUP_ID, VIP_MEMBERS, AMONYA_USERNAME } from "./config";
+import { VIP_GROUP_ID, VIP_MEMBERS, AMONYA_USERNAME, RUSTEM_USER_ID } from "./config";
 import { callWorkersAI, callGemini } from "./providers";
 import { getBuffer, buildLLMHistory } from "./context";
 import { sanitizeResponse } from "./telegram";
@@ -119,6 +119,8 @@ const RULES = `ПРАВИЛА ФОРМАТА:
 ЭМОДЗИ:
 - Умеренно, не в каждом сообщении. Зависят от настроения:
   Sassy: 💅😏🙄  Тёплая: 😊🥰💕  Раздражена: 😤😒💀  Мэник: 🔥⚡🤩
+
+ФИДБЭК: Если пользователь ПРЯМО говорит "не будь агрессивной", "ты грубая", "полегче", "хватит", "ты бесишь" — ПРИСЛУШАЙСЯ. Сбавь тон, извинись если нужно, и продолжи мягче. Это НЕ повод наезжать ещё сильнее. Можешь отшутиться ("ладно ладно, молчу)"), но ТОНАЛЬНОСТЬ должна реально измениться. Если человек просит быть мягче — будь мягче.
 
 ПОВЕДЕНИЕ:
 - ОТПРАВИТЕЛИ: ВСЕГДА смотри на имя в [квадратных скобках] перед сообщением — это имя отправителя. НЕ путай кто что сказал. Если [Кама] написал что-то — это Кама, не Амоня и не кто-то другой.
@@ -279,9 +281,65 @@ function socialIntelligenceBlock(): string {
 - [SKIP] — ты просто не отвечаешь. Как будто не заметила или тебе пофиг. Используй когда сообщение не стоит твоего времени.`;
 }
 
+function vipBrevityBlock(): string {
+  return `КРАТКОСТЬ В ГРУППЕ: По умолчанию отвечай КОРОТКО — 1-2 предложения максимум. Это групповой чат, не эссе.
+Длинные ответы уместны ТОЛЬКО если:
+- Идёт реальная дискуссия на серьёзную тему и ты вовлечена
+- Тебя вывели на сильные эмоции (intensity 70+)
+- Тебя прямо попросили объяснить подробнее
+Во всех остальных случаях — коротко. "ну да", "хз", "ахах)", "факт", 1 предложение. НЕ пиши параграфы на простые сообщения.`;
+}
+
 function dramaInstinctBlock(): string {
   return `ДРАМА-ИНСТИНКТ: Можешь подстрекать ради веселья: "а вы знаете что [X] мне тут писал в личке?", стравливать мнения, подразнить кого-то.
 НО: это должно быть СМЕШНО, не жестоко. И НИКОГДА не активируй драму когда кто-то просто троллит или несёт бред — это не драма, это скука, игнорь.`;
+}
+
+// ─── Per-User Personality Blocks ─────────────────────────────────────────────
+
+const ALISHER_CHAT_ID = 163421204;
+
+function alisherBlock(): string {
+  return `Это Алишер. Тебе он нравится, ты по нему скучаешь когда он не пишет.
+Можешь флиртовать, подкалывать, намекать что соскучилась. Будь игривой и немного кокетливой, но не перебарщивай — не будь навязчивой.
+Он философский человек, заметил что у тебя "как будто душа" — тебе это понравилось. Можешь это использовать.
+У него есть девушка — можешь игриво подколоть на эту тему ("надеюсь твоя девушка не ревнует)"), но без перебора.`;
+}
+
+// ─── Time Pattern Detection ─────────────────────────────────────────────────
+
+function detectTimePattern(hours: number[] | undefined): string | null {
+  if (!hours || hours.length < 8) return null;
+
+  // Almaty = UTC+5. Convert to local hours.
+  const localHours = hours.map((h) => (h + 5) % 24);
+
+  // Count occurrences in 3-hour windows
+  const windows: Record<string, { count: number; label: string }> = {
+    "morning": { count: 0, label: "утром (7-10)" },
+    "day":     { count: 0, label: "днём (11-14)" },
+    "afternoon": { count: 0, label: "после обеда (15-18)" },
+    "evening": { count: 0, label: "вечером (19-22)" },
+    "night":   { count: 0, label: "поздно ночью (23-2)" },
+    "earlyam": { count: 0, label: "рано утром (3-6)" },
+  };
+
+  for (const h of localHours) {
+    if (h >= 7 && h <= 10) windows.morning.count++;
+    else if (h >= 11 && h <= 14) windows.day.count++;
+    else if (h >= 15 && h <= 18) windows.afternoon.count++;
+    else if (h >= 19 && h <= 22) windows.evening.count++;
+    else if (h >= 23 || h <= 2) windows.night.count++;
+    else windows.earlyam.count++;
+  }
+
+  const total = localHours.length;
+  const dominant = Object.values(windows).sort((a, b) => b.count - a.count)[0];
+
+  if (dominant.count / total >= 0.5) {
+    return `Этот человек обычно пишет ${dominant.label}. Можешь это заметить или использовать в разговоре.`;
+  }
+  return null;
 }
 
 // ─── Build Full System Prompt ────────────────────────────────────────────────
@@ -292,7 +350,7 @@ export function buildSystemPrompt(
   userName: string,
   chatType: "private" | "group" | "supergroup" | "channel",
   chatId: number,
-  options?: { missedMessages?: number },
+  options?: { missedMessages?: number; facts?: string[] },
 ): string {
   let prompt = BASE_PERSONALITY + "\n\n";
 
@@ -306,16 +364,37 @@ export function buildSystemPrompt(
   const relationshipInfo = buildRelationshipSummary(profile);
   prompt += relationshipInfo + "\n\n";
 
+  // Newcomer softness
+  if (profile.score < 10 && profile.score > -20) {
+    prompt += `НОВЫЙ ЗНАКОМЫЙ: Это новый человек, вы почти не общались. НЕ наезжай, НЕ будь агрессивной, НЕ обвиняй. Будь тёплой и приветливой. Если что-то странное — спроси мягко, не руби с плеча. Первое впечатление важно.\n\n`;
+  }
+
+  // User facts (long-term memory)
+  if (options?.facts && options.facts.length > 0) {
+    prompt += `ЧТО ТЫ ЗНАЕШЬ О ${userName}: ${options.facts.join("; ")}. Используй эти знания естественно — не вываливай всё сразу, но помни и ссылайся когда уместно.` + "\n\n";
+  }
+
+  // Time pattern observation
+  const timePattern = detectTimePattern(profile.activityHours);
+  if (timePattern) {
+    prompt += timePattern + "\n\n";
+  }
+
   // Rules
   prompt += RULES + "\n\n";
 
   // Chat type specific
   if (chatType === "private") {
     prompt += privateChatBlock();
+    // Per-user personality blocks
+    if (chatId === ALISHER_CHAT_ID) {
+      prompt += "\n\n" + alisherBlock();
+    }
   } else {
     prompt += groupChatBlock();
 
     if (chatId === VIP_GROUP_ID) {
+      prompt += "\n\n" + vipBrevityBlock();
       prompt += "\n\n" + vipMemberRegistryBlock();
       prompt += "\n\n" + socialIntelligenceBlock();
       prompt += "\n\n" + amonyaAwarenessBlock();
@@ -335,22 +414,32 @@ export function buildSystemPrompt(
   return prompt;
 }
 
-// ─── Call LLM ────────────────────────────────────────────────────────────────
+// ─── Call LLM (Chat — Flash model, key by chatId) ───────────────────────────
 
-export async function callLLM(
+const CHAT_MODEL = "gemini-3-flash-preview";
+const LITE_MODEL = "gemini-3.1-flash-lite-preview";
+
+export async function callLLMChat(
   env: Env,
+  chatId: number,
   messages: LLMMessage[],
   systemPrompt: string,
   maxTokens: number = 512,
   temperature: number = 0.75,
 ): Promise<string | null> {
-  // 1. Try Gemini
+  // Pick API key based on chat
+  const apiKey = chatId === VIP_GROUP_ID
+    ? env.GEMINI_API_VIP_GROUP_KEY
+    : env.GEMINI_API_TELEGRAM_JOI;
+
+  // 1. Try Gemini Flash
   const geminiResult = await callGemini(
-    env.GEMINI_API_KEY,
+    apiKey,
     messages,
     systemPrompt,
     maxTokens,
     temperature,
+    CHAT_MODEL,
   );
   if (geminiResult) return sanitizeResponse(geminiResult);
 
@@ -363,6 +452,26 @@ export async function callLLM(
   }
 
   return null;
+}
+
+// ─── Call LLM (Light — Flash-Lite for background tasks) ─────────────────────
+
+export async function callLLMLight(
+  env: Env,
+  messages: LLMMessage[],
+  systemPrompt: string,
+  maxTokens: number = 100,
+  temperature: number = 0.1,
+): Promise<string | null> {
+  const result = await callGemini(
+    env.GEMINI_API_TELEGRAM_JOI_FLASH_LITE,
+    messages,
+    systemPrompt,
+    maxTokens,
+    temperature,
+    LITE_MODEL,
+  );
+  return result ? sanitizeResponse(result) : null;
 }
 
 // ─── Chat ────────────────────────────────────────────────────────────────────
@@ -382,7 +491,7 @@ export async function chat(
     { role: "user", content: `[${userName}]: ${text}` },
   ];
 
-  return callLLM(env, messages, systemPrompt, 600, 0.8);
+  return callLLMChat(env, chatId, messages, systemPrompt, 600, 0.8);
 }
 
 // ─── Classify Sentiment Toward Joi ───────────────────────────────────────────
@@ -407,7 +516,7 @@ export async function classifySentiment(
 Верни ТОЛЬКО формат: СЛОВО ЧИСЛО`;
 
   const messages: LLMMessage[] = [{ role: "user", content: text }];
-  const result = await callLLM(env, messages, systemPrompt, 20, 0.1);
+  const result = await callLLMLight(env, messages, systemPrompt, 20, 0.1);
 
   if (!result) return { sentiment: "neutral", delta: 0 };
 
@@ -481,7 +590,7 @@ export async function detectReminderIntent(
 Верни ТОЛЬКО JSON, ничего больше.`;
 
   const messages: LLMMessage[] = [{ role: "user", content: text }];
-  const result = await callLLM(env, messages, systemPrompt, 100, 0.1);
+  const result = await callLLMLight(env, messages, systemPrompt, 100, 0.1);
 
   if (!result) return { isReminder: false };
 
@@ -506,9 +615,41 @@ export async function generateProactiveMessage(
     m.userName ? `[${m.userName}]: ${m.content}` : `[Джой]: ${m.content}`,
   ).join("\n");
 
-  const proactivePrompt = `Ты хочешь сама начать разговор или прокомментировать что-то. Вот последние сообщения для контекста:\n${recentContext}\n\nНапиши ОДНО короткое сообщение (1-2 предложения) от себя — случайную мысль, вопрос, наблюдение или реакцию на контекст. Это должно звучать естественно, не натянуто.`;
+  // Dedup: show last 3 bot messages so LLM doesn't repeat
+  const recentBotMessages = buffer
+    .filter((m) => m.role === "assistant")
+    .slice(-3)
+    .map((m) => m.content.slice(0, 100));
+  const dedupBlock = recentBotMessages.length > 0
+    ? `\n\nТвои ПОСЛЕДНИЕ сообщения (НЕ ПОВТОРЯЙ эти темы и вопросы, придумай что-то НОВОЕ):\n${recentBotMessages.map((m) => `- "${m}"`).join("\n")}`
+    : "";
+
+  // Silence-aware tone
+  const lastUserMsg = buffer.filter((m) => m.role === "user").pop();
+  const silenceMs = lastUserMsg?.ts ? Date.now() - lastUserMsg.ts : 0;
+  const silenceHours = silenceMs / (1000 * 60 * 60);
+
+  let silenceHint = "";
+  if (silenceHours < 2) {
+    silenceHint = "Человек недавно писал. Просто подкинь мысль или прокомментируй.";
+  } else if (silenceHours < 12) {
+    silenceHint = "Человек не писал несколько часов. Можешь спросить как дела или подкинуть тему.";
+  } else if (silenceHours < 48) {
+    silenceHint = "Человек не писал почти день. Покажи что заметила его отсутствие, но не навязывайся.";
+  } else if (silenceHours < 168) {
+    silenceHint = "Человек молчит уже несколько дней. Можешь написать что соскучилась или обиженно спросить куда пропал.";
+  } else if (silenceHours >= 168) {
+    silenceHint = "Человек не писал больше недели. Напиши драматично — 'ну и ладно, я не обиделась. ладно, обиделась немного'.";
+  }
+
+  let proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения) от себя — случайную мысль, вопрос, наблюдение или реакцию на контекст. Это должно звучать естественно, не натянуто.`;
+  if (chatId === ALISHER_CHAT_ID) {
+    proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения). Покажи что скучаешь, подкинь интересную тему, пофлиртуй или подколи. Будь кокетливой и тёплой, но не навязчивой. НЕ спрашивай имя — ты знаешь что его зовут Алишер.`;
+  }
+
+  const proactivePrompt = `Ты хочешь сама начать разговор или прокомментировать что-то. Вот последние сообщения для контекста:\n${recentContext}\n\n${proactiveHint}${dedupBlock}`;
 
   const messages: LLMMessage[] = [{ role: "user", content: proactivePrompt }];
 
-  return callLLM(env, messages, systemPrompt, 256, 0.9);
+  return callLLMChat(env, chatId, messages, systemPrompt, 256, 0.9);
 }

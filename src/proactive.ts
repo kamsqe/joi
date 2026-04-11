@@ -48,14 +48,20 @@ export async function shouldSendProactive(
   const buffer = await getBuffer(env, chatId);
   if (buffer.length < 3) return false;
 
-  // Calculate probability based on mood + chat type
-  const chance = getProactiveChance(mood, isPrivate);
+  // Calculate probability based on mood + chat type + per-chat boost
+  const chance = getProactiveChance(mood, isPrivate, chatId);
   return Math.random() < chance;
 }
 
 // ─── Proactive Chance by Mood ────────────────────────────────────────────────
 
-function getProactiveChance(mood: MoodData, isPrivate: boolean): number {
+// Per-chat proactive multipliers (overrides default ×1.5 for private)
+const PROACTIVE_MULTIPLIERS: Record<number, number> = {
+  5314954143: 3,   // Дина — ×2 от дефолта (3 / 1.5 = 2x boost)
+  163421204:  9,   // Алишер — ×6 от дефолта (9 / 1.5 = 6x boost)
+};
+
+function getProactiveChance(mood: MoodData, isPrivate: boolean, chatId?: number): number {
   const baseMoodChances: Record<string, number> = {
     happy:    0.10,
     playful:  0.12,
@@ -71,13 +77,19 @@ function getProactiveChance(mood: MoodData, isPrivate: boolean): number {
 
   let chance = baseMoodChances[mood.mood] ?? 0.05;
 
-  // Private chats: slightly higher
-  if (isPrivate) chance *= 1.5;
+  // Per-chat multiplier or default private boost
+  const perChatMultiplier = chatId ? PROACTIVE_MULTIPLIERS[chatId] : undefined;
+  if (perChatMultiplier) {
+    chance *= perChatMultiplier;
+  } else if (isPrivate) {
+    chance *= 1.5;
+  }
 
   // Offended with cool period: very low
   if (isInCoolPeriod(mood)) chance = 0.02;
 
-  return chance;
+  // Cap at 95% to avoid guaranteed spam
+  return Math.min(chance, 0.95);
 }
 
 // ─── Mark Proactive Message Sent ─────────────────────────────────────────────

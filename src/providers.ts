@@ -45,8 +45,8 @@ export async function callGemini(
   systemPrompt: string,
   maxTokens: number = 512,
   temperature: number = 0.75,
+  model: string = "gemini-3.1-flash-lite-preview",
 ): Promise<string | null> {
-  const model = "gemini-3.1-flash-lite-preview";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const contents: Array<{ role: string; parts: Array<{ text: string }> }> = [];

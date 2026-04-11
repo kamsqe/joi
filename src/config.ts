@@ -5,6 +5,9 @@ export interface Env {
   AI: Ai;
   TELEGRAM_BOT_TOKEN: string;
   GEMINI_API_KEY: string;
+  GEMINI_API_VIP_GROUP_KEY: string;
+  GEMINI_API_TELEGRAM_JOI: string;
+  GEMINI_API_TELEGRAM_JOI_FLASH_LITE: string;
 }
 
 // ─── Telegram Types ──────────────────────────────────────────────────────────
@@ -103,6 +106,7 @@ export interface UserProfile {
   lastInteraction: number;    // timestamp for decay calculation
   firstSeen: number;
   isFirstContact: boolean;    // true if we haven't asked their name yet (private)
+  activityHours?: number[];   // last 20 message hours (UTC) for time pattern detection
 }
 
 // ─── Reminders ───────────────────────────────────────────────────────────────
@@ -141,7 +145,9 @@ export const BOT_NAME_VARIANTS = [
 export const VIP_GROUP_ID = -1003199433987;
 export const VIP_PROACTIVE_TOPIC_ID = 16208;
 
-export const DAILY_RATE_LIMIT = 50;
+export const DAILY_RATE_LIMIT = 100;
+
+export const RUSTEM_USER_ID = 271113269;
 
 export const AMONYA_USERNAME = "amonya_chuy_valley_bot";
 
@@ -157,7 +163,7 @@ export interface VipMember {
 export const VIP_MEMBERS: VipMember[] = [
   { id: 1038120471, defaultName: "Кама", aliases: ["Камский"], gender: "male" },
   { id: 370789625, defaultName: "Аса", aliases: ["Асеке"], gender: "male" },
-  { id: 271113269, defaultName: "Рус", aliases: ["Руся"], gender: "male" },
+  { id: RUSTEM_USER_ID, defaultName: "Рус", aliases: ["Руся"], gender: "male" },
   { id: 163421204, defaultName: "Босс", aliases: ["Шеф", "Шефуля"], gender: "male" },
   { id: 521857800, defaultName: "Макс", aliases: [], gender: "male" },
 ];
