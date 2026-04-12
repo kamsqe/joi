@@ -1,12 +1,6 @@
-// ─── Mood Engine ─────────────────────────────────────────────────────────────
+// ─── Mood Engine (D1-backed) ─────────────────────────────────────────────────
 
 import type { Env, MoodState, MoodData } from "./config";
-
-const MOOD_TTL = 60 * 60 * 24 * 7; // 7 days
-
-function moodKey(chatId: number): string {
-  return `mood:${chatId}`;
-}
 
 // ─── All Possible Moods ──────────────────────────────────────────────────────
 
@@ -23,7 +17,6 @@ const POSITIVE_MOODS: MoodState[] = ["happy", "playful", "chill", "flirty", "man
 const NEGATIVE_MOODS: MoodState[] = ["annoyed", "mean", "serious", "unhinged"];
 
 // Mood transition weights: which moods naturally flow into which
-// Key = current mood, value = weighted pool of next moods
 const MOOD_TRANSITIONS: Record<MoodState, { mood: MoodState; weight: number }[]> = {
   happy:    [{ mood: "playful", weight: 3 }, { mood: "chill", weight: 2 }, { mood: "flirty", weight: 2 }, { mood: "manic", weight: 1 }, { mood: "serious", weight: 1 }],
   playful:  [{ mood: "happy", weight: 2 }, { mood: "flirty", weight: 2 }, { mood: "manic", weight: 2 }, { mood: "unhinged", weight: 1 }, { mood: "chill", weight: 1 }],
@@ -37,21 +30,73 @@ const MOOD_TRANSITIONS: Record<MoodState, { mood: MoodState; weight: number }[]>
   manic:    [{ mood: "unhinged", weight: 2 }, { mood: "playful", weight: 2 }, { mood: "happy", weight: 2 }, { mood: "annoyed", weight: 1 }],
 };
 
+// ─── In-Memory TTL Cache ─────────────────────────────────────────────────────
+
+interface MoodCacheEntry {
+  data: MoodData;
+  expiresAt: number;
+}
+
+const moodCache = new Map<number, MoodCacheEntry>();
+const MOOD_CACHE_TTL_MS = 30_000; // 30 seconds
+
+function cloneMood(m: MoodData): MoodData {
+  return { ...m };
+}
+
 // ─── Load / Save ─────────────────────────────────────────────────────────────
 
 export async function getMood(env: Env, chatId: number): Promise<MoodData> {
-  try {
-    const raw = await env.KV.get(moodKey(chatId));
-    if (raw) return JSON.parse(raw) as MoodData;
-  } catch { /* fall through to default */ }
+  // Check cache first
+  const cached = moodCache.get(chatId);
+  if (cached && Date.now() < cached.expiresAt) {
+    return cloneMood(cached.data);
+  }
 
-  return defaultMood();
+  const row = await env.DB.prepare(
+    `SELECT * FROM mood WHERE chat_id = ?`,
+  )
+    .bind(chatId)
+    .first<{
+      chat_id: number; mood: string; intensity: number; volatility: number;
+      last_change: number; offended_by: number | null; offense_reason: string | null;
+      cool_period_until: number | null;
+    }>();
+
+  if (!row) return defaultMood();
+
+  const mood: MoodData = {
+    mood: row.mood as MoodState,
+    intensity: row.intensity,
+    volatility: row.volatility,
+    lastChange: row.last_change,
+    offendedBy: row.offended_by || undefined,
+    offenseReason: row.offense_reason || undefined,
+    coolPeriodUntil: row.cool_period_until || undefined,
+  };
+
+  // Populate cache
+  moodCache.set(chatId, { data: cloneMood(mood), expiresAt: Date.now() + MOOD_CACHE_TTL_MS });
+  return mood;
 }
 
 export async function saveMood(env: Env, chatId: number, mood: MoodData): Promise<void> {
-  await env.KV.put(moodKey(chatId), JSON.stringify(mood), {
-    expirationTtl: MOOD_TTL,
-  });
+  // Write-through: update cache immediately
+  moodCache.set(chatId, { data: cloneMood(mood), expiresAt: Date.now() + MOOD_CACHE_TTL_MS });
+
+  await env.DB.prepare(
+    `INSERT INTO mood (chat_id, mood, intensity, volatility, last_change, offended_by, offense_reason, cool_period_until)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       mood = excluded.mood, intensity = excluded.intensity, volatility = excluded.volatility,
+       last_change = excluded.last_change, offended_by = excluded.offended_by,
+       offense_reason = excluded.offense_reason, cool_period_until = excluded.cool_period_until`,
+  )
+    .bind(
+      chatId, mood.mood, mood.intensity, mood.volatility, mood.lastChange,
+      mood.offendedBy || null, mood.offenseReason || null, mood.coolPeriodUntil || null,
+    )
+    .run();
 }
 
 function defaultMood(): MoodData {
@@ -68,14 +113,12 @@ function defaultMood(): MoodData {
 export async function maybeSwingMood(env: Env, chatId: number): Promise<MoodData> {
   const mood = await getMood(env, chatId);
 
-  // Calculate swing chance based on volatility
   const swingChance = getSwingChance(mood.volatility);
   const roll = Math.random();
 
   if (roll < swingChance) {
-    // Swing! Pick a new mood from weighted transitions
     const newMood = pickWeightedTransition(mood.mood);
-    const newIntensity = 30 + Math.floor(Math.random() * 50); // 30-80
+    const newIntensity = 30 + Math.floor(Math.random() * 50);
 
     mood.mood = newMood;
     mood.intensity = newIntensity;
@@ -90,9 +133,6 @@ export async function maybeSwingMood(env: Env, chatId: number): Promise<MoodData
 // ─── Swing Chance Based on Volatility ────────────────────────────────────────
 
 function getSwingChance(volatility: number): number {
-  // Low volatility (0.0-0.3): 3-5% chance
-  // Medium (0.3-0.7): 8-12% chance
-  // High (0.7-1.0): 15-20% chance
   if (volatility < 0.3) return 0.03 + volatility * 0.067;
   if (volatility < 0.7) return 0.08 + (volatility - 0.3) * 0.1;
   return 0.15 + (volatility - 0.7) * 0.167;
@@ -114,7 +154,6 @@ function pickWeightedTransition(currentMood: MoodState): MoodState {
 }
 
 // ─── Shift Mood by Sentiment ─────────────────────────────────────────────────
-// Called after LLM classifies user sentiment toward Joi
 
 export async function shiftMoodBySentiment(
   env: Env,
@@ -124,23 +163,18 @@ export async function shiftMoodBySentiment(
   const mood = await getMood(env, chatId);
 
   if (sentiment === "positive") {
-    // Nudge toward positive moods
     if (NEGATIVE_MOODS.includes(mood.mood)) {
-      // If currently negative, chance to recover
       if (Math.random() < 0.4) {
         mood.mood = POSITIVE_MOODS[Math.floor(Math.random() * POSITIVE_MOODS.length)];
         mood.intensity = 40 + Math.floor(Math.random() * 30);
         mood.lastChange = Date.now();
       } else {
-        // Just reduce intensity
         mood.intensity = Math.max(10, mood.intensity - 15);
       }
     } else {
-      // Already positive, boost intensity
       mood.intensity = Math.min(100, mood.intensity + 10);
     }
   } else if (sentiment === "negative") {
-    // Nudge toward negative moods
     if (POSITIVE_MOODS.includes(mood.mood)) {
       if (Math.random() < 0.5) {
         mood.mood = NEGATIVE_MOODS[Math.floor(Math.random() * NEGATIVE_MOODS.length)];
@@ -150,11 +184,9 @@ export async function shiftMoodBySentiment(
         mood.intensity = Math.max(10, mood.intensity - 20);
       }
     } else {
-      // Already negative, intensify
       mood.intensity = Math.min(100, mood.intensity + 15);
     }
   }
-  // neutral: no mood change
 
   await saveMood(env, chatId, mood);
   return mood;
@@ -171,10 +203,9 @@ export async function setOffended(
   const mood = await getMood(env, chatId);
 
   mood.mood = "offended";
-  mood.intensity = 80 + Math.floor(Math.random() * 20); // 80-100
+  mood.intensity = 80 + Math.floor(Math.random() * 20);
   mood.offendedBy = offenderId;
   mood.offenseReason = reason;
-  // Cool period: 2-4 hours
   mood.coolPeriodUntil = Date.now() + (2 + Math.random() * 2) * 60 * 60 * 1000;
   mood.lastChange = Date.now();
 
@@ -211,13 +242,11 @@ export function isInCoolPeriod(mood: MoodData): boolean {
 export async function driftVolatility(env: Env, chatId: number): Promise<void> {
   const mood = await getMood(env, chatId);
 
-  // Random nudge ±0.05–0.15
   const nudge = (Math.random() * 0.1 + 0.05) * (Math.random() < 0.5 ? -1 : 1);
   mood.volatility = Math.max(0, Math.min(1, mood.volatility + nudge));
 
-  // Auto-expire cool period
   if (mood.coolPeriodUntil && Date.now() > mood.coolPeriodUntil) {
-    mood.mood = "annoyed"; // downgrade from offended to annoyed
+    mood.mood = "annoyed";
     mood.intensity = 40;
     mood.coolPeriodUntil = undefined;
     mood.lastChange = Date.now();
@@ -231,13 +260,11 @@ export async function driftVolatility(env: Env, chatId: number): Promise<void> {
 export async function cronMoodShift(env: Env, chatId: number): Promise<void> {
   const mood = await getMood(env, chatId);
 
-  // Don't override offended state during cool period
   if (isInCoolPeriod(mood)) {
     await driftVolatility(env, chatId);
     return;
   }
 
-  // 20% chance of a mood shift on cron
   if (Math.random() < 0.2) {
     const newMood = pickWeightedTransition(mood.mood);
     mood.mood = newMood;
@@ -245,7 +272,6 @@ export async function cronMoodShift(env: Env, chatId: number): Promise<void> {
     mood.lastChange = Date.now();
   }
 
-  // Always drift volatility on cron
   const nudge = (Math.random() * 0.1 + 0.05) * (Math.random() < 0.5 ? -1 : 1);
   mood.volatility = Math.max(0, Math.min(1, mood.volatility + nudge));
 

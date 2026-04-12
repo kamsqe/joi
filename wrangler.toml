@@ -5,9 +5,7 @@ compatibility_date = "2024-12-05"
 [triggers]
 crons = ["*/5 * * * *"]
 
-[ai]
-binding = "AI"
-
-[[kv_namespaces]]
-binding = "KV"
-id = "0997f17add2045579ebdae1389b6145c"
+[[d1_databases]]
+binding = "DB"
+database_name = "joi-db"
+database_id = "97385810-ce5f-4b13-9594-ceb07a461041"

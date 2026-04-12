@@ -1,19 +1,21 @@
 // ─── Joi Bot — Main Entry Point ─────────────────────────────────────────────
 
 import type { Env, TelegramMessage } from "./config";
-import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID, VIP_PROACTIVE_TOPIC_ID, RUSTEM_USER_ID } from "./config";
+import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID, VIP_PROACTIVE_TOPIC_ID, RUSTEM_USER_ID, AMONYA_BOT_ID } from "./config";
 import { parseUpdate, sendMessage, sendSticker, sendChatAction, setMessageReaction, formatForTelegram } from "./telegram";
 import { resolveUserName, registerActiveChat, getActiveChats, isFirstContact, isThirdPartyNicknameRequest } from "./users";
-import { saveUserMessage, saveBotMessage } from "./context";
-import { buildSystemPrompt, chat, classifySentiment, detectNicknameRequest, detectReminderIntent, generateProactiveMessage } from "./ai";
+import { saveUserMessage, saveBotMessage, pruneOldMessages } from "./context";
+import { buildSystemPrompt, buildProactiveSystemPrompt, chat, classifySentiment, batchAnalyzeMessage, detectNicknameRequest, detectReminderIntent, generateProactiveMessage } from "./ai";
 import { getMood, maybeSwingMood, shiftMoodBySentiment, setOffended, clearOffense, cronMoodShift } from "./mood";
-import { getProfile, saveProfile, adjustScore, setNickname, markFirstContactDone } from "./relationships";
-import { checkRateLimit, checkRPMThrottle, trackLLMCall, enterBlackout, getBlackoutState } from "./rate-limit";
+import { getProfile, saveProfile, adjustScore, setNickname, markFirstContactDone, updateSentimentAvg } from "./relationships";
+import { checkRateLimit, checkRPMThrottle, trackLLMCall, enterBlackout, getBlackoutState, pruneExpiredRateLimits } from "./rate-limit";
 import type { ThrottleLevel } from "./rate-limit";
-import { shouldSendProactive, markProactiveSent, checkPendingFollowUp, scheduleFollowUp } from "./proactive";
+import { shouldSendProactive, markProactiveSent, hasPendingFollowUp, scheduleFollowUp } from "./proactive";
 import { createReminder, getChatReminders, getDueReminders, processReminder, parseRelativeTime, computeReminderDates, findReminderByDescription } from "./reminders";
 import { pickStickerForMood, extractStickerTag } from "./stickers";
-import { getFacts, extractAndSaveFacts } from "./facts";
+import { getFacts, extractAndSaveFacts, getRecentActiveFacts, saveBatchFacts } from "./facts";
+import { maybeBookmarkMoment, getEmotionalEvents } from "./memory";
+import { shouldGenerateDigest, generateAndStoreDigest, pruneOldDigests } from "./digests";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
 
@@ -27,7 +29,10 @@ export default {
       const update = parseUpdate(body);
 
       if (update?.message) {
-        ctx.waitUntil(handleMessage(env, ctx, update.message));
+        ctx.waitUntil(
+          handleMessage(env, ctx, update.message)
+            .catch(err => console.error("[FATAL] handleMessage crashed:", err))
+        );
       }
 
       return new Response("OK", { status: 200 });
@@ -91,26 +96,44 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
     ? (text ? `[${mediaType}] ${text}` : `[Отправил ${mediaType}]`)
     : text;
 
-  // Save message to buffer
-  if (bufferText) ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText));
+  // Extract forward/reply metadata for D1 context builder
+  const isForwarded = !!(message.forward_from_chat || message.forward_from || message.forward_sender_name);
+  const forwardSource = message.forward_from_chat?.title
+    || message.forward_sender_name
+    || message.forward_from?.first_name
+    || null;
+  const isSenderBot = message.from?.is_bot || message.from?.id === AMONYA_BOT_ID;
+  const replyToMsgId = message.reply_to_message?.message_id || null;
 
-  // Extract facts from user message (non-blocking, background)
-  if (text && text.length >= 10) {
-    ctx.waitUntil(extractAndSaveFacts(env, chatId, userId, text));
-  }
+  // Save message options (used later — we defer D1 save to avoid duplication in private context)
+  const saveOpts: import("./context").SaveMessageOptions = {
+    messageId: message.message_id,
+    isBot: isSenderBot,
+    isForwarded,
+    forwardSource,
+    replyToMessageId: replyToMsgId,
+    threadId: threadId || null,
+  };
 
   // Determine if bot should respond
   const shouldReply = isPrivate || shouldRespondInGroup(message, text);
 
   if (!shouldReply) {
+    // Save to D1 immediately for passive messages (won't cause duplication since no LLM call)
+    if (bufferText) ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
+
+    // Extract facts for passive messages (separate call, non-blocking)
+    if (text && text.length >= 25) {
+      ctx.waitUntil(extractAndSaveFacts(env, chatId, userId, text).catch(e => console.error("[BG] extractFacts:", e)));
+    }
+
     // Passive processing: mood swing chance, spontaneous reactions
     const mood = await maybeSwingMood(env, chatId);
     ctx.waitUntil(handlePassiveInteraction(env, chatId, messageId, mood));
 
     // Maybe schedule a delayed follow-up
-    const buffer = await import("./context").then((m) => m.getBuffer(env, chatId));
     if (Math.random() < 0.08 && text) {
-      ctx.waitUntil(scheduleFollowUp(env, chatId, text, buffer.length));
+      ctx.waitUntil(scheduleFollowUp(env, chatId, text));
     }
     return;
   }
@@ -118,7 +141,8 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
   // ─── RPM Throttle Check ─────────────────────────────────────────────────────
   const throttle = await checkRPMThrottle(env);
   if (throttle === "blackout") {
-    // Silently save to buffer but don't respond
+    // Save user message so it's not lost from context, but don't respond
+    if (bufferText) ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
     ctx.waitUntil(enterBlackout(env, chatId));
     return;
   }
@@ -141,11 +165,12 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
   }
 
   // ─── Bare Name Call Detection ("джой" without context) ────────────────────
-  if (text && isBareNameCall(text)) {
+  // Skip in private chats — every message is addressed to Joi, treat as real conversation
+  if (!isPrivate && text && isBareNameCall(text)) {
     const bareResponses = ["ау?", "ау", "да?", "че", "м?", "слушаю", "хм?", "ну?"];
     const pick = bareResponses[Math.floor(Math.random() * bareResponses.length)];
-    await sendMessage(env, chatId, pick, messageId, threadId);
-    ctx.waitUntil(saveBotMessage(env, chatId, pick));
+    const sent = await sendMessage(env, chatId, pick, messageId, threadId);
+    ctx.waitUntil(saveBotMessage(env, chatId, pick, sent?.message_id));
     return;
   }
 
@@ -161,11 +186,23 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
     if (rustemResult) return; // handled (skipped or passive-aggressive reply sent)
   }
 
+  // Save user message to D1 BEFORE the LLM call, but AFTER context is built.
+  // For private chats: we must save AFTER buildPrivateContext to avoid duplication.
+  // For group chats: the layered context builder uses separate layers, so saving first is fine.
+  // Solution: save for group chats now, defer for private chats (handleActiveMessage does it).
+  if (!isPrivate && bufferText) {
+    ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
+  }
+
   // Active response path
   try {
-    await handleActiveMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, isPrivate, throttle);
+    await handleActiveMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, isPrivate, throttle, bufferText, saveOpts);
   } catch (err) {
     console.error("Message handling error:", err);
+    // Make sure message is saved even on error
+    if (isPrivate && bufferText) {
+      ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
+    }
     const errorResponses = [
       "блин, мысль потеряла",
       "чёт я зависла, повтори",
@@ -276,8 +313,17 @@ async function handleActiveMessage(
   threadId?: number,
   isPrivate?: boolean,
   throttle: ThrottleLevel = "normal",
+  bufferText?: string,
+  saveOpts?: import("./context").SaveMessageOptions,
 ): Promise<void> {
   const text = stripBotMention(rawText);
+
+  // Helper: save user message to D1 for private chats (called on early-return paths)
+  const ensureSaved = () => {
+    if (isPrivate && bufferText && saveOpts) {
+      ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
+    }
+  };
 
   // Load mood & profile
   const mood = await maybeSwingMood(env, chatId);
@@ -286,8 +332,7 @@ async function handleActiveMessage(
   // Track activity hour for time patterns
   const currentHour = new Date().getUTCHours();
   profile.activityHours = [...(profile.activityHours || []).slice(-19), currentHour];
-  ctx.waitUntil(saveProfile(env, profile));
-
+  
   // Check blackout recovery
   const blackout = await getBlackoutState(env, chatId);
   let missedMessages = 0;
@@ -295,17 +340,37 @@ async function handleActiveMessage(
     missedMessages = blackout.missedMessages;
   }
 
-  // Classify sentiment toward Joi — skip in lazy mode to save RPM
+  // Batch analyze: sentiment + facts in ONE LLM call (skip in lazy mode)
   let sentimentResult: { sentiment: "positive" | "negative" | "neutral"; delta: number } = { sentiment: "neutral", delta: 0 };
-  if (throttle !== "lazy") {
+  if (throttle !== "lazy" && text.length >= 10) {
+    const batchResult = await batchAnalyzeMessage(env, text);
+    sentimentResult = batchResult.sentiment;
+    ctx.waitUntil(trackLLMCall(env));
+
+    // Save facts from batch result (non-blocking)
+    if (batchResult.facts.length > 0) {
+      ctx.waitUntil(
+        saveBatchFacts(env, chatId, userId, batchResult.facts).catch(e => console.error("[BG] batchFacts:", e))
+      );
+    }
+  } else if (throttle !== "lazy") {
+    // Short messages — just sentiment, no facts to extract
     sentimentResult = await classifySentiment(env, text);
     ctx.waitUntil(trackLLMCall(env));
   }
 
-  // Update relationship score
-  if (sentimentResult.delta !== 0) {
-    ctx.waitUntil(adjustScore(env, chatId, userId, sentimentResult.delta));
+  // Apply sentiment changes to profile sequentially in memory
+  if (sentimentResult.sentiment !== "neutral") {
+    // 1. Update relationship score
+    profile.score += sentimentResult.delta;
+    
+    // 2. Update sentiment rolling average (EMA alpha = 0.15)
+    const val = sentimentResult.sentiment === "positive" ? 1.0 : -1.0;
+    profile.sentimentAvg = profile.sentimentAvg === 0 ? val : (profile.sentimentAvg * 0.85) + (val * 0.15);
   }
+
+  // Save profile ONCE after all modifications to prevent race conditions
+  ctx.waitUntil(saveProfile(env, profile));
 
   // Update mood based on sentiment
   if (sentimentResult.sentiment !== "neutral") {
@@ -322,6 +387,14 @@ async function handleActiveMessage(
     }
   }
 
+  // Bookmark significant emotional moments (non-blocking)
+  if (Math.abs(sentimentResult.delta) >= 5) {
+    ctx.waitUntil(
+      maybeBookmarkMoment(env, chatId, userId, text, sentimentResult.sentiment, sentimentResult.delta)
+        .catch(e => console.error("[BG] bookmark:", e))
+    );
+  }
+
   // ─── Command Routing ─────────────────────────────────────────────────────
 
   const command = extractCommand(text);
@@ -329,14 +402,17 @@ async function handleActiveMessage(
     switch (command.name) {
       case "help":
       case "помощь":
+        ensureSaved();
         await handleHelp(env, chatId, messageId, threadId);
         return;
       case "reminders":
       case "напоминания":
+        ensureSaved();
         await handleListReminders(env, chatId, messageId, threadId);
         return;
       case "start":
         if (isPrivate) {
+          ensureSaved();
           await handleFirstContact(env, chatId, userId, messageId, threadId);
           return;
         }
@@ -346,6 +422,7 @@ async function handleActiveMessage(
   // ─── First Contact (private chat) ────────────────────────────────────────
 
   if (isPrivate && profile.isFirstContact) {
+    ensureSaved();
     await handleFirstContact(env, chatId, userId, messageId, threadId);
     return;
   }
@@ -359,8 +436,9 @@ async function handleActiveMessage(
       .replace(/[.!?,)(\s]+$/g, "")
       .trim();
     if (possibleName.length >= 2 && possibleName.length <= 20 && !possibleName.includes(" ")) {
+      ensureSaved();
       await setNickname(env, chatId, userId, possibleName);
-      const systemPrompt = buildSystemPrompt(mood, profile, possibleName, chatType as any, chatId);
+      const systemPrompt = buildSystemPrompt(mood, profile, possibleName, chatType as any, chatId, { currentUserId: userId });
       const response = await chat(env, `[Новый знакомый представился: "${possibleName}"]. Приветливо поздоровайся, используй имя, скажи что-нибудь приятное. Будь тёплой и дружелюбной.`, possibleName, systemPrompt, chatId);
       if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
       return;
@@ -371,7 +449,8 @@ async function handleActiveMessage(
 
   // Check if someone is trying to change someone ELSE's nickname (VIP only)
   if (isThirdPartyNicknameRequest(text, userId, chatId)) {
-    const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId);
+    ensureSaved();
+    const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { currentUserId: userId });
     const response = await chat(env, `[${userName} пытается изменить чужое имя]: ${text}\n\n(Откажи мягко, скажи "пусть сам попросит" в своём стиле)`, userName, systemPrompt, chatId);
     if (response) {
       await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
@@ -382,8 +461,9 @@ async function handleActiveMessage(
   // Check for own nickname change request
   const nicknameRequest = await detectNicknameRequest(env, text);
   if (nicknameRequest) {
+    ensureSaved();
     await setNickname(env, chatId, userId, nicknameRequest);
-    const systemPrompt = buildSystemPrompt(mood, profile, nicknameRequest, chatType as any, chatId);
+    const systemPrompt = buildSystemPrompt(mood, profile, nicknameRequest, chatType as any, chatId, { currentUserId: userId });
     const response = await chat(env, `[Пользователь попросил называть его "${nicknameRequest}"]. Подтверди что будешь так называть, скажи что-нибудь милое/игривое про новое имя.`, nicknameRequest, systemPrompt, chatId);
     if (response) {
       await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
@@ -397,6 +477,7 @@ async function handleActiveMessage(
   if (reminderKeywords.some((kw) => text.toLowerCase().includes(kw))) {
     const reminderIntent = await detectReminderIntent(env, text);
     if (reminderIntent.isReminder) {
+      ensureSaved();
       await handleReminderCreation(env, ctx, chatId, userId, userName, messageId, threadId, mood, profile, chatType, reminderIntent, text);
       return;
     }
@@ -406,27 +487,34 @@ async function handleActiveMessage(
 
   const cancelKeywords = ["отмени напоминание", "удали напоминание", "cancel reminder"];
   if (cancelKeywords.some((kw) => text.toLowerCase().includes(kw))) {
+    ensureSaved();
     await handleReminderCancel(env, chatId, userId, messageId, threadId, text, mood, profile, userName, chatType);
     return;
   }
 
   // ─── Default: Chat ───────────────────────────────────────────────────────
 
+  const startChat = Date.now();
   const facts = await getFacts(env, chatId, userId);
-  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts });
+  const emotionalEvents = await getEmotionalEvents(env, chatId, userId);
+  // Compute days since last message for rare speaker detection
+  const daysSinceLastMessage = profile.lastInteraction
+    ? Math.floor((Date.now() - profile.lastInteraction) / 86_400_000)
+    : undefined;
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage });
 
   // Send "typing" indicator before LLM call
   await sendChatAction(env, chatId, "typing", threadId);
 
-  // Include reply context if replying to something
-  let chatText = text;
-  if (message.reply_to_message?.text || message.reply_to_message?.caption) {
-    const repliedText = message.reply_to_message!.text || message.reply_to_message!.caption || "";
-    chatText = `[Ответ на сообщение: "${repliedText.slice(0, 300)}"]\n\n${text}`;
-  }
-
-  const response = await chat(env, chatText, userName, systemPrompt, chatId);
+  // The layered context builder in chat() handles reply chains via D1 thread walking
+  const replyToMsgIdForContext = message.reply_to_message?.message_id || null;
+  const response = await chat(env, text, userName, systemPrompt, chatId, replyToMsgIdForContext, userId);
   ctx.waitUntil(trackLLMCall(env));
+
+  // Save user message to D1 AFTER context is built (prevents duplication in private chat context)
+  if (isPrivate && bufferText && saveOpts) {
+    ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
+  }
 
   if (response) {
     await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
@@ -439,6 +527,23 @@ async function handleActiveMessage(
     const pick = fallbackResponses[Math.floor(Math.random() * fallbackResponses.length)];
     await sendMessage(env, chatId, pick, messageId, threadId);
   }
+
+  // ─── Structured Logging ──────────────────────────────────────────────────
+  console.log(JSON.stringify({
+    event: "msg_processed",
+    chatId,
+    userId,
+    chatType: isPrivate ? "private" : "group",
+    mood: mood.mood,
+    moodI: mood.intensity,
+    sentiment: sentimentResult.sentiment,
+    sentDelta: sentimentResult.delta,
+    score: profile.score,
+    sentAvg: Math.round(profile.sentimentAvg * 100) / 100,
+    facts: facts.length,
+    responded: !!response,
+    latency: Date.now() - startChat,
+  }));
 }
 
 // ─── Send Response + Handle Stickers + Message Splitting ─────────────────────
@@ -492,7 +597,7 @@ async function sendAndSave(
       threadId,
     );
     if (sent) {
-      ctx.waitUntil(saveBotMessage(env, chatId, parts[i]));
+      ctx.waitUntil(saveBotMessage(env, chatId, parts[i], sent.message_id));
     }
   }
 
@@ -536,13 +641,10 @@ async function handleFirstContact(
   threadId?: number,
 ): Promise<void> {
   await markFirstContactDone(env, chatId, userId);
-  await sendMessage(
-    env,
-    chatId,
-    "Привет! 😊 Я Джой. Как мне тебя называть?",
-    messageId,
-    threadId,
-  );
+  const greeting = "Привет! 😊 Я Джой. Как мне тебя называть?";
+  const sent = await sendMessage(env, chatId, greeting, messageId, threadId);
+  // Save greeting to D1 so context builder can see it
+  await saveBotMessage(env, chatId, greeting, sent?.message_id);
 }
 
 // ─── Help ────────────────────────────────────────────────────────────────────
@@ -580,7 +682,7 @@ async function handleReminderCreation(
   intent: { description?: string; when?: string; recurrence?: string },
   originalText?: string,
 ): Promise<void> {
-  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId);
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { currentUserId: userId });
 
   if (!intent.description) {
     const response = await chat(env, "[Пользователь хочет создать напоминание но не указал о чём]. Спроси что напомнить.", userName, systemPrompt, chatId);
@@ -713,22 +815,50 @@ function extractCommand(text: string): { name: string; args: string } | null {
 // ─── Cron Handler ────────────────────────────────────────────────────────────
 
 async function handleCron(env: Env): Promise<void> {
+  // Housekeeping: prune old messages (30-day retention) and expired rate limits
+  await pruneOldMessages(env);
+  await pruneExpiredRateLimits(env);
+  await pruneOldDigests(env);
+
   const chatIds = await getActiveChats(env);
 
   for (const chatId of chatIds) {
+    try {
     // 1. Drift mood + volatility
     await cronMoodShift(env, chatId);
 
+    // 1b. Generate conversation digest for group chats (RPM-guarded)
+    const isGroupChat = chatId < 0;
+    if (isGroupChat) {
+      const throttle = await checkRPMThrottle(env);
+      if (throttle !== "block") {
+        const needsDigest = await shouldGenerateDigest(env, chatId);
+        if (needsDigest) {
+          await generateAndStoreDigest(env, chatId);
+        }
+      }
+    }
+
     // 2. Check pending follow-ups
     const proactiveTopicId = chatId === VIP_GROUP_ID ? VIP_PROACTIVE_TOPIC_ID : undefined;
-    const followUp = await checkPendingFollowUp(env, chatId);
-    if (followUp.shouldSend && followUp.topicSnapshot) {
+    const followUp = await hasPendingFollowUp(env, chatId);
+    if (followUp) {
       const mood = await getMood(env, chatId);
       const isPrivateChat = chatId > 0;
       const followUpUserId = isPrivateChat ? chatId : 0;
       const profile = await getProfile(env, chatId, followUpUserId);
       const chatType = isPrivateChat ? "private" : "supergroup";
-      const systemPrompt = buildSystemPrompt(mood, profile, profile.nickname || "", chatType as any, chatId);
+      const facts = isPrivateChat ? await getFacts(env, chatId, followUpUserId) : await getRecentActiveFacts(env, chatId);
+      // Load digest context for group proactive messages
+      let activityDigest: string | undefined;
+      let latestDigest: string | undefined;
+      if (!isPrivateChat) {
+        const { buildActivityDigest, loadRecentDigests, formatDigestsForPrompt } = await import("./digests");
+        activityDigest = (await buildActivityDigest(env, chatId)) || undefined;
+        const digests = await loadRecentDigests(env, chatId, 1);
+        latestDigest = formatDigestsForPrompt(digests) || undefined;
+      }
+      const systemPrompt = buildProactiveSystemPrompt(mood, profile, profile.nickname || "", chatType as any, chatId, { facts, activityDigest, latestDigest });
       const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
       if (response) {
         const { cleanText } = extractStickerTag(response);
@@ -743,14 +873,41 @@ async function handleCron(env: Env): Promise<void> {
     // 3. Random proactive message (suppress at night 00:00-07:00 Almaty)
     const almatyHour = (new Date().getUTCHours() + 5) % 24;
     const isNight = almatyHour >= 0 && almatyHour < 7;
-    const isPrivate = chatId > 0; // Telegram: positive IDs = private, negative = group
-    if (!isNight && await shouldSendProactive(env, chatId, isPrivate)) {
+    const { should: shouldProactive } = await shouldSendProactive(env, chatId);
+    if (!isNight && shouldProactive) {
       const mood = await getMood(env, chatId);
+      const isPrivate = chatId > 0;
       const proactiveUserId = isPrivate ? chatId : 0;
       const profile = await getProfile(env, chatId, proactiveUserId);
       const chatType = isPrivate ? "private" : "supergroup";
-      const facts = isPrivate ? await getFacts(env, chatId, proactiveUserId) : [];
-      const systemPrompt = buildSystemPrompt(mood, profile, profile.nickname || "", chatType, chatId, { facts });
+      const facts = isPrivate ? await getFacts(env, chatId, proactiveUserId) : await getRecentActiveFacts(env, chatId);
+      // Load digest context for group proactive messages
+      let activityDigest: string | undefined;
+      let latestDigest: string | undefined;
+      let recentMessages: string | undefined;
+      if (!isPrivate) {
+        const { buildActivityDigest, loadRecentDigests, formatDigestsForPrompt } = await import("./digests");
+        activityDigest = (await buildActivityDigest(env, chatId)) || undefined;
+        const digests = await loadRecentDigests(env, chatId, 1);
+        latestDigest = formatDigestsForPrompt(digests) || undefined;
+
+        // Load recent messages so proactive messages reference actual conversation
+        const recentRows = await env.DB.prepare(
+          `SELECT user_name, content FROM messages
+           WHERE chat_id = ? AND role = 'user' AND is_bot = 0 AND is_forwarded = 0
+           ORDER BY ts DESC LIMIT 8`,
+        )
+          .bind(chatId)
+          .all<{ user_name: string; content: string }>();
+
+        if (recentRows.results && recentRows.results.length > 0) {
+          const lines = recentRows.results.reverse().map(
+            (m) => `[${m.user_name || "?"}]: ${m.content.slice(0, 150)}`
+          );
+          recentMessages = `ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ (для контекста, чтобы ты не писала невпопад):\n${lines.join("\n")}`;
+        }
+      }
+      const systemPrompt = buildProactiveSystemPrompt(mood, profile, profile.nickname || "", chatType, chatId, { facts, activityDigest, latestDigest, recentMessages });
       const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
       if (response) {
         const { cleanText, emotion } = extractStickerTag(response);
@@ -765,29 +922,36 @@ async function handleCron(env: Env): Promise<void> {
         await markProactiveSent(env, chatId);
       }
     }
+    } catch (err) {
+      console.error(`[CRON] Error processing chat ${chatId}:`, err);
+    }
+  }
 
-    // 4. Check due reminders
-    const dueReminders = await getDueReminders(env, [chatId]);
+  // 4. Check due reminders (outside chat loop — getDueReminders is global)
+  try {
+    const dueReminders = await getDueReminders(env);
     for (const reminder of dueReminders) {
-      const mood = await getMood(env, chatId);
-      const profile = await getProfile(env, chatId, reminder.userId);
-      const userName = await resolveUserName(env, chatId, reminder.userId);
-      const chatType = chatId > 0 ? "private" : "supergroup";
-      const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId);
+      const mood = await getMood(env, reminder.chatId);
+      const profile = await getProfile(env, reminder.chatId, reminder.userId);
+      const userName = await resolveUserName(env, reminder.chatId, reminder.userId);
+      const chatType = reminder.chatId > 0 ? "private" : "supergroup";
+      const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, reminder.chatId);
 
       const response = await chat(
         env,
         `[НАПОМИНАНИЕ для ${userName}: "${reminder.description}"]. Напомни в своём стиле, обращаясь к ${userName}.`,
-        userName, systemPrompt, chatId,
+        userName, systemPrompt, reminder.chatId,
       );
 
       if (response) {
-        await sendMessage(env, chatId, formatForTelegram(response));
-        await saveBotMessage(env, chatId, response);
+        await sendMessage(env, reminder.chatId, formatForTelegram(response));
+        await saveBotMessage(env, reminder.chatId, response);
       }
 
       await processReminder(env, reminder);
     }
+  } catch (err) {
+    console.error("[CRON] Error processing reminders:", err);
   }
 }
 
@@ -807,10 +971,10 @@ const APOLOGY_KEYWORDS = [
 
 async function getRustemApologyState(env: Env): Promise<{ count: number; firstAt: number; lastAt: number }> {
   const key = `rustem_apologies:${VIP_GROUP_ID}`;
-  try {
-    const raw = await env.KV.get(key);
-    if (raw) return JSON.parse(raw);
-  } catch { /* fall through */ }
+  const row = await env.DB.prepare(
+    `SELECT data FROM rate_limits WHERE key = ?`,
+  ).bind(key).first<{ data: string | null }>();
+  if (row?.data) return JSON.parse(row.data);
   return { count: 0, firstAt: 0, lastAt: 0 };
 }
 
@@ -820,11 +984,16 @@ async function trackRustemApology(env: Env): Promise<void> {
   state.count += 1;
   if (state.firstAt === 0) state.firstAt = Date.now();
   state.lastAt = Date.now();
-  await env.KV.put(key, JSON.stringify(state), { expirationTtl: 60 * 60 * 24 * 30 }); // 30 days
+  const expiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000; // 30 days
+  await env.DB.prepare(
+    `INSERT INTO rate_limits (key, count, data, expires_at) VALUES (?, 0, ?, ?)
+     ON CONFLICT(key) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`,
+  ).bind(key, JSON.stringify(state), expiresAt).run();
 }
 
 async function resetRustemApologies(env: Env): Promise<void> {
-  await env.KV.delete(`rustem_apologies:${VIP_GROUP_ID}`);
+  await env.DB.prepare(`DELETE FROM rate_limits WHERE key = ?`)
+    .bind(`rustem_apologies:${VIP_GROUP_ID}`).run();
 }
 
 function isRustemApology(text: string): boolean {
@@ -914,17 +1083,23 @@ const TROLL_STREAK_TTL = 600; // 10 minutes — streak resets after inactivity
 
 async function getTrollStreak(env: Env, chatId: number, userId: number): Promise<number> {
   const key = `troll:${chatId}:${userId}`;
-  const val = await env.KV.get(key);
-  return val ? parseInt(val, 10) : 0;
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    `SELECT count FROM rate_limits WHERE key = ? AND expires_at > ?`,
+  ).bind(key, now).first<{ count: number }>();
+  return row?.count || 0;
 }
 
 async function incrementTrollStreak(env: Env, chatId: number, userId: number): Promise<void> {
   const key = `troll:${chatId}:${userId}`;
-  const current = await getTrollStreak(env, chatId, userId);
-  await env.KV.put(key, String(current + 1), { expirationTtl: TROLL_STREAK_TTL });
+  const expiresAt = Date.now() + TROLL_STREAK_TTL * 1000;
+  await env.DB.prepare(
+    `INSERT INTO rate_limits (key, count, expires_at) VALUES (?, 1, ?)
+     ON CONFLICT(key) DO UPDATE SET count = count + 1, expires_at = excluded.expires_at`,
+  ).bind(key, expiresAt).run();
 }
 
 async function resetTrollStreak(env: Env, chatId: number, userId: number): Promise<void> {
   const key = `troll:${chatId}:${userId}`;
-  await env.KV.delete(key);
+  await env.DB.prepare(`DELETE FROM rate_limits WHERE key = ?`).bind(key).run();
 }

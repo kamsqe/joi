@@ -1,8 +1,7 @@
 // ─── Environment & Types ─────────────────────────────────────────────────────
 
 export interface Env {
-  KV: KVNamespace;
-  AI: Ai;
+  DB: D1Database;
   TELEGRAM_BOT_TOKEN: string;
   GEMINI_API_KEY: string;
   GEMINI_API_VIP_GROUP_KEY: string;
@@ -61,7 +60,7 @@ export interface LLMMessage {
   content: string;
 }
 
-// ─── Context Buffer ──────────────────────────────────────────────────────────
+// ─── Context Buffer (D1 row representation) ─────────────────────────────────
 
 export interface BufferMessage {
   role: "user" | "assistant";
@@ -69,6 +68,11 @@ export interface BufferMessage {
   userName?: string;
   userId?: number;
   ts: number;
+  messageId?: number;
+  isBot?: boolean;
+  isForwarded?: boolean;
+  forwardSource?: string;
+  replyToMessageId?: number;
 }
 
 // ─── Mood System ─────────────────────────────────────────────────────────────
@@ -103,6 +107,7 @@ export interface UserProfile {
   nickname?: string;          // user-chosen nickname (overrides defaults)
   nicknameOverride: boolean;  // true if user personally asked for a name change
   score: number;              // -100 to +100
+  sentimentAvg: number;       // rolling average of recent sentiment (-1.0 to +1.0)
   lastInteraction: number;    // timestamp for decay calculation
   firstSeen: number;
   isFirstContact: boolean;    // true if we haven't asked their name yet (private)
@@ -145,11 +150,31 @@ export const BOT_NAME_VARIANTS = [
 export const VIP_GROUP_ID = -1003199433987;
 export const VIP_PROACTIVE_TOPIC_ID = 16208;
 
+// Forum topic ID → human-readable name (for system prompt injection)
+export const VIP_TOPIC_NAMES: Record<number, string> = {
+  1: "Общий",
+  2452: "Тех/Игры",
+  2475: "Разное",
+  3164: "Активности в Алматы",
+  4764: "Экономика/Финансы",
+  2457: "Новости",
+  2478: "Бачелор зона (девушки/рилсы)",
+  3874: "Возможности",
+  2481: "Музыка",
+  2455: "Мемы",
+  16208: "Канал Джой и Амони",
+  2458: "Здоровье/Спорт",
+  2712: "Новые стикеры",
+  2474: "Путешествия",
+  8873: "Промпты",
+};
+
 export const DAILY_RATE_LIMIT = 100;
 
 export const RUSTEM_USER_ID = 271113269;
 
 export const AMONYA_USERNAME = "amonya_chuy_valley_bot";
+export const AMONYA_BOT_ID = 8464398774;
 
 // ─── VIP Group Pre-loaded Members ────────────────────────────────────────────
 

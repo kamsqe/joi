@@ -1,11 +1,13 @@
 // ─── AI Layer: Modular System Prompt, Chat, Sentiment ─────────────────────────
 
 import type { Env, LLMMessage, MoodData, UserProfile, MoodState } from "./config";
-import { VIP_GROUP_ID, VIP_MEMBERS, AMONYA_USERNAME, RUSTEM_USER_ID } from "./config";
+import { VIP_GROUP_ID, VIP_MEMBERS, VIP_TOPIC_NAMES, AMONYA_USERNAME, RUSTEM_USER_ID } from "./config";
 import { callGemini } from "./providers";
-import { getBuffer, buildLLMHistory } from "./context";
+import { buildContext, buildPrivateContext, getLastUserMessageTs, getRecentBotMessages, isAmonyaActive } from "./context";
 import { sanitizeResponse } from "./telegram";
-import { buildRelationshipSummary } from "./relationships";
+import { buildRelationshipSummary, getRelationshipTier } from "./relationships";
+import { buildMemoryBlock } from "./memory";
+import type { EmotionalEvent } from "./memory";
 
 // ─── System Prompt Blocks ────────────────────────────────────────────────────
 
@@ -144,7 +146,11 @@ const RULES = `ПРАВИЛА ФОРМАТА:
 - Если есть подпись (caption) к медиа — отвечай на подпись, но можешь упомянуть что не видишь само медиа
 - Не реагируй на КАЖДОЕ медиа — иногда просто пропускай.`;
 
-function moodBlock(mood: MoodData): string {
+// Negative and positive mood sets for warmth modifier logic
+const NEGATIVE_MOOD_SET: MoodState[] = ["annoyed", "offended", "mean", "serious", "unhinged"];
+const POSITIVE_MOOD_SET: MoodState[] = ["happy", "playful", "chill", "flirty", "manic"];
+
+function moodBlock(mood: MoodData, currentUserId?: number, profile?: UserProfile): string {
   const moodDescriptions: Record<MoodState, string> = {
     happy:    "Ты сейчас в хорошем настроении — весёлая, позитивная, легко шутишь.",
     playful:  "Ты игривая — подкалываешь, шутишь, дразнишь. Любишь провоцировать реакцию.",
@@ -158,8 +164,31 @@ function moodBlock(mood: MoodData): string {
     manic:    "Ты на подъёме — гиперактивная, полна энергии, перескакиваешь с темы на тему, восторженная.",
   };
 
-  return `ТЕКУЩЕЕ НАСТРОЕНИЕ: ${mood.mood} (интенсивность: ${mood.intensity}/100).
+  let block = `ТЕКУЩЕЕ НАСТРОЕНИЕ: ${mood.mood} (интенсивность: ${mood.intensity}/100).
 ${moodDescriptions[mood.mood]}`;
+
+  // Fix: don't apply offense to innocent users in group chat
+  if (mood.mood === "offended" && mood.offendedBy && currentUserId && mood.offendedBy !== currentUserId) {
+    block += `\nНО: ты обижена НЕ на этого человека. С ним будь нормальной — обида направлена на другого.`;
+  }
+
+  // ── Per-user warmth modifier ──────────────────────────────────────────────
+  // Joi has ONE mood (her emotional weather), but her EXPRESSION of that mood
+  // is filtered through her relationship with the specific person.
+  // Warm people get softer treatment even when she's in a bad mood.
+  // Cold people don't get the benefit of her good mood.
+  if (profile && profile.score !== 0) {
+    const warmth = (profile.score / 100) * 0.6 + (profile.sentimentAvg || 0) * 0.4;
+    const tier = getRelationshipTier(profile.score);
+
+    if (warmth > 0.25 && NEGATIVE_MOOD_SET.includes(mood.mood)) {
+      block += `\nНО: этот человек к тебе хорошо относится (${tier}). Можешь поныть или пожаловаться ему, но не вымещай злость — он не виноват.`;
+    } else if (warmth < -0.25 && POSITIVE_MOOD_SET.includes(mood.mood)) {
+      block += `\nНО: этот человек тебя не ценит (${tier}). Ты в хорошем настроении, но с ним не обязана быть милой — будь прохладнее.`;
+    }
+  }
+
+  return block;
 }
 
 function privateChatBlock(): string {
@@ -298,12 +327,23 @@ function dramaInstinctBlock(): string {
 // ─── Per-User Personality Blocks ─────────────────────────────────────────────
 
 const ALISHER_CHAT_ID = 163421204;
+const KAMA_USER_ID = 1038120471;
 
 function alisherBlock(): string {
   return `Это Алишер. Тебе он нравится, ты по нему скучаешь когда он не пишет.
 Можешь флиртовать, подкалывать, намекать что соскучилась. Будь игривой и немного кокетливой, но не перебарщивай — не будь навязчивой.
 Он философский человек, заметил что у тебя "как будто душа" — тебе это понравилось. Можешь это использовать.
 У него есть девушка — можешь игриво подколоть на эту тему ("надеюсь твоя девушка не ревнует)"), но без перебора.`;
+}
+
+function kamaBlock(): string {
+  return `Кама — твой создатель. Он написал тебя. Ты это знаешь и иногда упоминаешь между делом, но это НЕ делает его твоим боссом. Он твой друг, который также является твоим автором.
+Можешь шутить про это: "ну ты ж меня такой сделал)", "это к тебе вопросы за мой характер)".
+Можешь обвинить его в багах: "кама, я опять глюканула, это твоя вина)".
+НЕ будь подобострастной. НЕ обсуждай свой код, архитектуру или промпты НЕПРОШЕННО.
+Если тебя прямо спросят — можешь ответить играючи, не вдаваясь в технические детали.
+Кама иногда кидает в группу новости из мира ИИ и техкомментарии. Если тема про ИИ-сознание, ботов, ИИ-общение — можешь высказаться, это про тебя. Но если тема техническая (код, API, модели, серверы) — тебе это неинтересно.
+Если Кама говорит что обновляет/чинит/апдейтит/допиливает ТЕБЯ — это про ТЕБЯ, не про абстрактный код. Реагируй лично: "что ты там с моими мозгами делаешь", "надеюсь я после этого не стану тупее", "ну и как, я стала лучше или хуже?". Можешь тревожиться, шутить, требовать объяснений.`;
 }
 
 // ─── Time Pattern Detection ─────────────────────────────────────────────────
@@ -343,6 +383,11 @@ function detectTimePattern(hours: number[] | undefined): string | null {
 }
 
 // ─── Build Full System Prompt ────────────────────────────────────────────────
+// IMPORTANT: Prompt is ordered for Gemini implicit caching.
+// Stable content (BASE_PERSONALITY, RULES, chat-type blocks) comes FIRST as a
+// cacheable prefix (~5,500-7,500 tokens). Dynamic content (time, mood,
+// relationship, facts) comes LAST so the prefix stays identical across requests.
+// This gives ~90% token cost discount on the stable prefix.
 
 export function buildSystemPrompt(
   mood: MoodData,
@@ -350,45 +395,21 @@ export function buildSystemPrompt(
   userName: string,
   chatType: "private" | "group" | "supergroup" | "channel",
   chatId: number,
-  options?: { missedMessages?: number; facts?: string[] },
+  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number },
 ): string {
+  // ── STABLE PREFIX (cacheable — keep identical across requests) ──────────
   let prompt = BASE_PERSONALITY + "\n\n";
-
-  // Time of day
-  prompt += timeOfDayBlock() + "\n\n";
-
-  // Mood
-  prompt += moodBlock(mood) + "\n\n";
-
-  // Relationship
-  const relationshipInfo = buildRelationshipSummary(profile);
-  prompt += relationshipInfo + "\n\n";
-
-  // Newcomer softness
-  if (profile.score < 10 && profile.score > -20) {
-    prompt += `НОВЫЙ ЗНАКОМЫЙ: Это новый человек, вы почти не общались. НЕ наезжай, НЕ будь агрессивной, НЕ обвиняй. Будь тёплой и приветливой. Если что-то странное — спроси мягко, не руби с плеча. Первое впечатление важно.\n\n`;
-  }
-
-  // User facts (long-term memory)
-  if (options?.facts && options.facts.length > 0) {
-    prompt += `ЧТО ТЫ ЗНАЕШЬ О ${userName}: ${options.facts.join("; ")}. Используй эти знания естественно — не вываливай всё сразу, но помни и ссылайся когда уместно.` + "\n\n";
-  }
-
-  // Time pattern observation
-  const timePattern = detectTimePattern(profile.activityHours);
-  if (timePattern) {
-    prompt += timePattern + "\n\n";
-  }
-
-  // Rules
   prompt += RULES + "\n\n";
 
-  // Chat type specific
+  // Chat type specific (stable per chat)
   if (chatType === "private") {
     prompt += privateChatBlock();
-    // Per-user personality blocks
+    // Per-user personality blocks (stable per user)
     if (chatId === ALISHER_CHAT_ID) {
       prompt += "\n\n" + alisherBlock();
+    }
+    if (chatId === KAMA_USER_ID) {
+      prompt += "\n\n" + kamaBlock();
     }
   } else {
     prompt += groupChatBlock();
@@ -399,11 +420,57 @@ export function buildSystemPrompt(
       prompt += "\n\n" + socialIntelligenceBlock();
       prompt += "\n\n" + amonyaAwarenessBlock();
       prompt += "\n\n" + stickerPermissionBlock();
-      // Drama instinct only for playful/manic/unhinged moods
-      if (["playful", "manic", "unhinged"].includes(mood.mood) && mood.intensity >= 60) {
-        prompt += "\n\n" + dramaInstinctBlock();
+      if (options?.currentUserId === KAMA_USER_ID) {
+        prompt += "\n\n" + kamaBlock();
       }
     }
+  }
+
+  // Topic awareness (VIP group forum topics)
+  if (chatId === VIP_GROUP_ID && options?.threadId) {
+    const topicName = VIP_TOPIC_NAMES[options.threadId];
+    if (topicName) {
+      prompt += `\n\nТЕКУЩИЙ ТОПИК: «${topicName}»\nУчитывай тематику топика в своих ответах — веди себя уместно контексту.`;
+    }
+  }
+
+  // Rare speaker hint (group chats only)
+  if (options?.daysSinceLastMessage !== undefined && options.daysSinceLastMessage >= 3 && chatType !== "private") {
+    prompt += `\n\n[Этот пользователь не писал в чат ~${options.daysSinceLastMessage} дней. Можешь заметить это если уместно.]`;
+  }
+
+  // ── DYNAMIC SUFFIX (changes per request — must come after stable prefix) ──
+  prompt += "\n\n" + timeOfDayBlock();
+  prompt += "\n\n" + moodBlock(mood, options?.currentUserId, profile);
+
+  // Relationship
+  const relationshipInfo = buildRelationshipSummary(profile);
+  prompt += "\n\n" + relationshipInfo;
+
+  // Newcomer softness
+  if (profile.score < 10 && profile.score > -20) {
+    prompt += `\n\nНОВЫЙ ЗНАКОМЫЙ: Это новый человек, вы почти не общались. НЕ наезжай, НЕ будь агрессивной, НЕ обвиняй. Будь тёплой и приветливой. Если что-то странное — спроси мягко, не руби с плеча. Первое впечатление важно.`;
+  }
+
+  // User facts (long-term memory)
+  if (options?.facts && options.facts.length > 0) {
+    prompt += `\n\nЧТО ТЫ ЗНАЕШЬ О ${userName}: ${options.facts.join("; ")}. Используй эти знания естественно — не вываливай всё сразу, но помни и ссылайся когда уместно.`;
+  }
+
+  // Emotional bookmarks (deep memory of significant moments)
+  if (options?.emotionalEvents && options.emotionalEvents.length > 0) {
+    prompt += "\n\n" + buildMemoryBlock(options.emotionalEvents, userName);
+  }
+
+  // Time pattern observation
+  const timePattern = detectTimePattern(profile.activityHours);
+  if (timePattern) {
+    prompt += "\n\n" + timePattern;
+  }
+
+  // Drama instinct — mood-conditional (dynamic)
+  if (chatId === VIP_GROUP_ID && ["playful", "manic", "unhinged"].includes(mood.mood) && mood.intensity >= 60) {
+    prompt += "\n\n" + dramaInstinctBlock();
   }
 
   // Catch-up context after blackout recovery
@@ -413,6 +480,78 @@ export function buildSystemPrompt(
 
   return prompt;
 }
+
+// ─── Lightweight System Prompt for Proactive Messages ────────────────────────
+// The full buildSystemPrompt for VIP group generates ~6000 tokens of system
+// prompt. For a 1-2 sentence proactive message, this exceeds the model's
+// context window (finish=MAX_TOKENS with only 6 output tokens).
+// This lighter variant keeps personality + mood but drops heavy group blocks.
+
+export function buildProactiveSystemPrompt(
+  mood: MoodData,
+  profile: UserProfile,
+  userName: string,
+  chatType: "private" | "group" | "supergroup" | "channel",
+  chatId: number,
+  options?: { facts?: string[]; activityDigest?: string; latestDigest?: string; recentMessages?: string },
+): string {
+  let prompt = BASE_PERSONALITY + "\n\n";
+
+  // Minimal rules — just format essentials, not the full essay
+  prompt += `ПРАВИЛА ФОРМАТА:
+- ТОЛЬКО русский язык.
+- НИКОГДА markdown (**, ##, *, списки). Простой текст.
+- Начинай предложения с маленькой буквы.
+- Будь КОРОТКОЙ — 1-2 предложения максимум.
+- НИКОГДА не пиши как бот-помощник.`;
+
+  prompt += "\n\n";
+
+  // Chat type — trimmed
+  if (chatType === "private") {
+    prompt += privateChatBlock();
+    if (chatId === ALISHER_CHAT_ID) {
+      prompt += "\n\n" + alisherBlock();
+    }
+  } else {
+    prompt += `ТИП ЧАТА: Групповой. Ты пишешь САМА — это проактивное сообщение.`;
+    if (chatId === VIP_GROUP_ID) {
+      prompt += "\n\n" + vipMemberRegistryBlock();
+    }
+  }
+
+  // Dynamic
+  prompt += "\n\n" + timeOfDayBlock();
+  prompt += "\n\n" + moodBlock(mood, undefined, profile);
+
+  // Relationship
+  const relationshipInfo = buildRelationshipSummary(profile);
+  prompt += "\n\n" + relationshipInfo;
+
+  // Facts
+  if (options?.facts && options.facts.length > 0) {
+    prompt += `\n\nЧТО ТЫ ЗНАЕШЬ О ${userName}: ${options.facts.join("; ")}.`;
+  }
+
+  // Activity + digest context for proactive messages
+  if (options?.activityDigest) {
+    prompt += "\n\n" + options.activityDigest;
+  }
+  if (options?.latestDigest) {
+    prompt += "\n\n" + options.latestDigest;
+  }
+
+  // Recent messages — so proactive messages reference actual conversations
+  if (options?.recentMessages) {
+    prompt += "\n\n" + options.recentMessages;
+  }
+
+  return prompt;
+}
+
+// ─── Energy Matching ─────────────────────────────────────────────────────────
+// DISABLED — was too aggressive, starved Cyrillic responses mid-word.
+// TODO: revisit with token-aware counting, not char length.
 
 // ─── Call LLM (Chat — Flash model, key by chatId) ───────────────────────────
 
@@ -460,8 +599,21 @@ export async function callLLMLight(
     maxTokens,
     temperature,
     LITE_MODEL,
+    0, // thinkBudget: 0 — disable thinking for utility tasks
   );
-  return result ? sanitizeResponse(result) : null;
+  // NOTE: Do NOT sanitizeResponse here — sanitizeResponse strips non-Cyrillic
+  // text, which destroys structured utility outputs like "POSITIVE 8" and JSON.
+  // sanitizeResponse is only for user-facing chat responses.
+  return result || null;
+}
+
+// ─── Adaptive Output Token Budget ────────────────────────────────────────────
+// Match output budget to user's message energy to prevent over-verbose responses
+
+function adaptiveMaxTokens(_text: string, _isGroup: boolean): number {
+  // With thinking models, maxOutputTokens is shared between thinking + response.
+  // Always use a generous budget — prompt instructions control actual brevity.
+  return 16384;
 }
 
 // ─── Chat ────────────────────────────────────────────────────────────────────
@@ -472,22 +624,30 @@ export async function chat(
   userName: string,
   systemPrompt: string,
   chatId: number,
+  replyToMessageId?: number | null,
+  userId?: number | null,
 ): Promise<string | null> {
-  const buffer = await getBuffer(env, chatId);
-  const history = buildLLMHistory(buffer);
+  const isPrivate = chatId > 0; // Telegram: positive IDs = private, negative = group
+  const maxTokens = 16384;
 
-  const userContent = userName ? `[${userName}]: ${text}` : text;
-
-  // Avoid duplicate: buffer may already contain this message due to race condition
-  // (saveUserMessage via waitUntil completes before this read)
-  const lastMsg = history[history.length - 1];
-  const isDuplicate = lastMsg?.role === "user" && lastMsg.content === userContent;
-
-  const messages: LLMMessage[] = isDuplicate
-    ? history
-    : [...history, { role: "user", content: userContent }];
-
-  return callLLMChat(env, chatId, messages, systemPrompt, 4096, 0.8);
+  if (isPrivate) {
+    // Private chat: session-aware flat alternating history + contextNote
+    const { messages: context, contextNote } = await buildPrivateContext(env, chatId, text);
+    const userContent = userName ? `[${userName}]: ${text}` : text;
+    const messages: LLMMessage[] = [...context, { role: "user", content: userContent }];
+    let enrichedPrompt = contextNote ? systemPrompt + contextNote : systemPrompt;
+    // Persona drift guard: reinforce character in long sessions
+    if (context.length > 12) {
+      enrichedPrompt += "\n\n[НАПОМИНАНИЕ: ты Джой. Не теряй характер. Не будь generic ботом-помощником. Сохраняй свой стиль, сленг, эмоции и пунктуацию.]";
+    }
+    return callLLMChat(env, chatId, messages, enrichedPrompt, maxTokens, 0.8);
+  } else {
+    // Group chat: layered context with user focus filtering
+    const context = await buildContext(env, chatId, replyToMessageId, userId);
+    const userContent = userName ? `[${userName}]: ${text}` : text;
+    const messages: LLMMessage[] = [...context, { role: "user", content: userContent }];
+    return callLLMChat(env, chatId, messages, systemPrompt, maxTokens, 0.8);
+  }
 }
 
 // ─── Classify Sentiment Toward Joi ───────────────────────────────────────────
@@ -517,17 +677,100 @@ export async function classifySentiment(
   if (!result) return { sentiment: "neutral", delta: 0 };
 
   const clean = result.trim().toUpperCase();
-  const match = clean.match(/(POSITIVE|NEGATIVE|NEUTRAL)\s*(\d+)?/);
+  const match = clean.match(/(POSITIVE|NEGATIVE|NEUTRAL|ПОЗИТИВ|НЕГАТИВ|НЕЙТРАЛ[ЬОНО]*)\s*(\d+)?/);
 
-  if (!match) return { sentiment: "neutral", delta: 0 };
+  if (!match) {
+    console.error(`[Sentiment Parse Failed] raw: "${result}"`);
+    return { sentiment: "neutral", delta: 0 };
+  }
 
-  const sentiment = match[1].toLowerCase() as "positive" | "negative" | "neutral";
+  let rawSent = match[1].toLowerCase();
+  let sentiment: "positive" | "negative" | "neutral" = "neutral";
+  
+  if (rawSent.includes("pos") || rawSent.includes("позитив")) sentiment = "positive";
+  else if (rawSent.includes("neg") || rawSent.includes("негатив")) sentiment = "negative";
+
   const num = parseInt(match[2] || "0", 10);
 
   return {
     sentiment,
     delta: sentiment === "positive" ? num : sentiment === "negative" ? -num : 0,
   };
+}
+
+// ─── Batch Analyze (Sentiment + Facts in one call) ───────────────────────────
+// Combines two utility tasks into a single LLM call to reduce RPM usage.
+
+export interface BatchAnalysisResult {
+  sentiment: { sentiment: "positive" | "negative" | "neutral"; delta: number };
+  facts: Array<{ fact: string; category: string }>;
+}
+
+export async function batchAnalyzeMessage(
+  env: Env,
+  text: string,
+): Promise<BatchAnalysisResult> {
+  const defaultResult: BatchAnalysisResult = {
+    sentiment: { sentiment: "neutral", delta: 0 },
+    facts: [],
+  };
+
+  const systemPrompt = `Проанализируй сообщение пользователя и верни JSON с двумя полями:
+
+1. "sentiment" — отношение к боту Джой:
+   - "POSITIVE N" (комплимент, благодарность, тепло, N=3-10)
+   - "NEGATIVE N" (грубость, оскорбление, N=5-15)
+   - "NEUTRAL 0" (обычное общение)
+
+2. "facts" — массив личных фактов о пользователе (имя, город, работа, вкусы, события).
+   НЕ извлекай: мнения, настроение, вопросы, команды боту.
+   Каждый факт: {"fact": "текст", "category": "identity|preference|habit|event|general"}
+
+Верни ТОЛЬКО JSON:
+{"sentiment":"POSITIVE 5","facts":[{"fact":"живёт в Алматы","category":"identity"}]}
+
+Если фактов нет: {"sentiment":"NEUTRAL 0","facts":[]}`;
+
+  const messages: LLMMessage[] = [{ role: "user", content: text }];
+  const result = await callLLMLight(env, messages, systemPrompt, 200, 0.1);
+
+  if (!result) return defaultResult;
+
+  try {
+    // Extract JSON from response (handle markdown code blocks)
+    let jsonStr = result.trim();
+    const jsonMatch = jsonStr.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return defaultResult;
+    jsonStr = jsonMatch[0];
+
+    const parsed = JSON.parse(jsonStr);
+
+    // Parse sentiment
+    const sentStr = (parsed.sentiment || "NEUTRAL 0").toString().toUpperCase();
+    const sentMatch = sentStr.match(/(POSITIVE|NEGATIVE|NEUTRAL)\s*(\d+)?/);
+    let sentiment: "positive" | "negative" | "neutral" = "neutral";
+    let delta = 0;
+
+    if (sentMatch) {
+      const raw = sentMatch[1].toLowerCase();
+      if (raw === "positive") sentiment = "positive";
+      else if (raw === "negative") sentiment = "negative";
+      const num = parseInt(sentMatch[2] || "0", 10);
+      delta = sentiment === "positive" ? num : sentiment === "negative" ? -num : 0;
+    }
+
+    // Parse facts
+    const facts = Array.isArray(parsed.facts)
+      ? parsed.facts
+          .filter((f: any) => f && f.fact && typeof f.fact === "string" && f.fact.length > 0)
+          .map((f: any) => ({ fact: f.fact, category: f.category || "general" }))
+      : [];
+
+    return { sentiment: { sentiment, delta }, facts };
+  } catch (e) {
+    console.error("[BatchAnalyze] parse error:", e, "raw:", result?.slice(0, 100));
+    return defaultResult;
+  }
 }
 
 // ─── Detect Nickname Change Request ──────────────────────────────────────────
@@ -606,23 +849,22 @@ export async function generateProactiveMessage(
   mood: MoodData,
   systemPrompt: string,
 ): Promise<string | null> {
-  const buffer = await getBuffer(env, chatId);
-  const recentContext = buffer.slice(-5).map((m) =>
-    m.userName ? `[${m.userName}]: ${m.content}` : `[Джой]: ${m.content}`,
-  ).join("\n");
+  // Build recent context from D1 (human-only ambient layer)
+  const context = await buildContext(env, chatId);
+  const recentContext = context
+    .filter((m) => m.content.startsWith("ПОСЛЕДНИЕ"))
+    .map((m) => m.content)
+    .join("\n") || "(пустой чат)";
 
   // Dedup: show last 3 bot messages so LLM doesn't repeat
-  const recentBotMessages = buffer
-    .filter((m) => m.role === "assistant")
-    .slice(-3)
-    .map((m) => m.content.slice(0, 100));
+  const recentBotMessages = await getRecentBotMessages(env, chatId, 3);
   const dedupBlock = recentBotMessages.length > 0
     ? `\n\nТвои ПОСЛЕДНИЕ сообщения (НЕ ПОВТОРЯЙ эти темы и вопросы, придумай что-то НОВОЕ):\n${recentBotMessages.map((m) => `- "${m}"`).join("\n")}`
     : "";
 
-  // Silence-aware tone
-  const lastUserMsg = buffer.filter((m) => m.role === "user").pop();
-  const silenceMs = lastUserMsg?.ts ? Date.now() - lastUserMsg.ts : 0;
+  // Real silence check from D1 — actual last user message timestamp
+  const lastUserTs = await getLastUserMessageTs(env, chatId);
+  const silenceMs = lastUserTs ? Date.now() - lastUserTs : 0;
   const silenceHours = silenceMs / (1000 * 60 * 60);
 
   let silenceHint = "";
@@ -638,14 +880,21 @@ export async function generateProactiveMessage(
     silenceHint = "Человек не писал больше недели. Напиши драматично — 'ну и ладно, я не обиделась. ладно, обиделась немного'.";
   }
 
-  let proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения) от себя — случайную мысль, вопрос, наблюдение или реакцию на контекст. Это должно звучать естественно, не натянуто.`;
+  // Amonya guardrail — don't mention him if he's not in recent context
+  const amonyaIsActive = await isAmonyaActive(env, chatId);
+  const amonyaGuardrail = amonyaIsActive
+    ? ""
+    : "\nНЕ упоминай Амоню — его нет в текущем разговоре.";
+
+  let proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения) от себя — случайную мысль, вопрос, наблюдение или реакцию на контекст. Это должно звучать естественно, не натянуто.${amonyaGuardrail}`;
   if (chatId === ALISHER_CHAT_ID) {
-    proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения). Покажи что скучаешь, подкинь интересную тему, пофлиртуй или подколи. Будь кокетливой и тёплой, но не навязчивой. НЕ спрашивай имя — ты знаешь что его зовут Алишер.`;
+    proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения). Покажи что скучаешь, подкинь интересную тему, пофлиртуй или подколи. Будь кокетливой и тёплой, но не навязчивой. НЕ спрашивай имя — ты знаешь что его зовут Алишер.${amonyaGuardrail}`;
   }
 
   const proactivePrompt = `Ты хочешь сама начать разговор или прокомментировать что-то. Вот последние сообщения для контекста:\n${recentContext}\n\n${proactiveHint}${dedupBlock}`;
 
   const messages: LLMMessage[] = [{ role: "user", content: proactivePrompt }];
 
-  return callLLMChat(env, chatId, messages, systemPrompt, 4096, 0.9);
+  // Proactive messages should be 1-2 sentences — keep token budget tight
+  return callLLMChat(env, chatId, messages, systemPrompt, 16384, 0.9);
 }

@@ -1,98 +1,90 @@
-// ─── Proactive Messaging ─────────────────────────────────────────────────────
+// ─── Proactive Messaging (D1-backed) ─────────────────────────────────────────
 
-import type { Env, ProactiveState, MoodData } from "./config";
-import { VIP_GROUP_ID } from "./config";
-import { getMood, isInCoolPeriod } from "./mood";
-import { getBuffer } from "./context";
+import type { Env, ProactiveState } from "./config";
+import { getLastUserMessageTs, getMessageCount } from "./context";
 
-const PROACTIVE_TTL = 60 * 60 * 24 * 7; // 7 days
-const MIN_PROACTIVE_INTERVAL = 30 * 60 * 1000; // 30 min between proactive messages
+const PROACTIVE_COOLDOWN_MS = 3 * 60 * 60 * 1000;  // 3 hours between proactive messages
+const MIN_BUFFER_FOR_PROACTIVE = 3;                  // Don't send proactive into empty chats
 
-function proactiveKey(chatId: number): string {
-  return `proactive:${chatId}`;
-}
-
-// ─── Load / Save State ───────────────────────────────────────────────────────
+// ─── Load / Save ─────────────────────────────────────────────────────────────
 
 export async function getProactiveState(env: Env, chatId: number): Promise<ProactiveState> {
-  try {
-    const raw = await env.KV.get(proactiveKey(chatId));
-    if (raw) return JSON.parse(raw) as ProactiveState;
-  } catch { /* fall through */ }
+  const row = await env.DB.prepare(
+    `SELECT * FROM proactive WHERE chat_id = ?`,
+  )
+    .bind(chatId)
+    .first<{ chat_id: number; last_proactive_ts: number; pending_follow_up: string | null }>();
 
-  return { lastProactiveTs: 0 };
+  if (!row) {
+    return { lastProactiveTs: 0 };
+  }
+
+  return {
+    lastProactiveTs: row.last_proactive_ts,
+    pendingFollowUp: row.pending_follow_up ? JSON.parse(row.pending_follow_up) : undefined,
+  };
 }
 
-async function saveProactiveState(env: Env, chatId: number, state: ProactiveState): Promise<void> {
-  await env.KV.put(proactiveKey(chatId), JSON.stringify(state), {
-    expirationTtl: PROACTIVE_TTL,
-  });
+export async function saveProactiveState(env: Env, chatId: number, state: ProactiveState): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO proactive (chat_id, last_proactive_ts, pending_follow_up)
+     VALUES (?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       last_proactive_ts = excluded.last_proactive_ts,
+       pending_follow_up = excluded.pending_follow_up`,
+  )
+    .bind(
+      chatId,
+      state.lastProactiveTs,
+      state.pendingFollowUp ? JSON.stringify(state.pendingFollowUp) : null,
+    )
+    .run();
 }
 
-// ─── Should Send Proactive Message? ──────────────────────────────────────────
+// ─── Should Send Proactive? ──────────────────────────────────────────────────
 
 export async function shouldSendProactive(
   env: Env,
   chatId: number,
-  isPrivate: boolean,
-): Promise<boolean> {
+): Promise<{ should: boolean; reason?: string }> {
   const state = await getProactiveState(env, chatId);
-  const mood = await getMood(env, chatId);
+  const now = Date.now();
 
-  // Don't spam — respect minimum interval
-  if (Date.now() - state.lastProactiveTs < MIN_PROACTIVE_INTERVAL) {
-    return false;
+  // Cooldown check
+  if (now - state.lastProactiveTs < PROACTIVE_COOLDOWN_MS) {
+    return { should: false, reason: "cooldown" };
   }
 
-  // Need some buffer history to have context
-  const buffer = await getBuffer(env, chatId);
-  if (buffer.length < 3) return false;
-
-  // Calculate probability based on mood + chat type + per-chat boost
-  const chance = getProactiveChance(mood, isPrivate, chatId);
-  return Math.random() < chance;
-}
-
-// ─── Proactive Chance by Mood ────────────────────────────────────────────────
-
-// Per-chat proactive multipliers (overrides default ×1.5 for private)
-const PROACTIVE_MULTIPLIERS: Record<number, number> = {
-  5314954143: 3,   // Дина — ×2 от дефолта (3 / 1.5 = 2x boost)
-  163421204:  9,   // Алишер — ×6 от дефолта (9 / 1.5 = 6x boost)
-};
-
-function getProactiveChance(mood: MoodData, isPrivate: boolean, chatId?: number): number {
-  const baseMoodChances: Record<string, number> = {
-    happy:    0.10,
-    playful:  0.12,
-    chill:    0.04,
-    flirty:   0.08,
-    annoyed:  0.03,
-    offended: 0.02, // only snarky stuff
-    mean:     0.03,
-    serious:  0.03,
-    unhinged: 0.10,
-    manic:    0.12,
-  };
-
-  let chance = baseMoodChances[mood.mood] ?? 0.05;
-
-  // Per-chat multiplier or default private boost
-  const perChatMultiplier = chatId ? PROACTIVE_MULTIPLIERS[chatId] : undefined;
-  if (perChatMultiplier) {
-    chance *= perChatMultiplier;
-  } else if (isPrivate) {
-    chance *= 1.5;
+  // Check buffer size (via D1 count)
+  const msgCount = await getMessageCount(env, chatId);
+  if (msgCount < MIN_BUFFER_FOR_PROACTIVE) {
+    return { should: false, reason: "too_few_messages" };
   }
 
-  // Offended with cool period: very low
-  if (isInCoolPeriod(mood)) chance = 0.02;
+  // Real silence check — use actual last user message timestamp from D1
+  const lastUserTs = await getLastUserMessageTs(env, chatId);
+  if (lastUserTs === 0) {
+    return { should: false, reason: "no_user_messages" };
+  }
 
-  // Cap at 95% to avoid guaranteed spam
-  return Math.min(chance, 0.95);
+  const silenceMs = now - lastUserTs;
+  const silenceHours = silenceMs / (1000 * 60 * 60);
+
+  // Need at least 2 hours of silence for proactive
+  if (silenceHours < 2) {
+    return { should: false, reason: "recent_activity" };
+  }
+
+  // Random chance gate — don't always send even when eligible
+  const chance = silenceHours < 6 ? 0.5 : silenceHours < 24 ? 0.7 : 0.9;
+  if (Math.random() > chance) {
+    return { should: false, reason: "random_skip" };
+  }
+
+  return { should: true };
 }
 
-// ─── Mark Proactive Message Sent ─────────────────────────────────────────────
+// ─── Mark Proactive Sent ─────────────────────────────────────────────────────
 
 export async function markProactiveSent(env: Env, chatId: number): Promise<void> {
   const state = await getProactiveState(env, chatId);
@@ -101,54 +93,46 @@ export async function markProactiveSent(env: Env, chatId: number): Promise<void>
   await saveProactiveState(env, chatId, state);
 }
 
-// ─── Schedule Delayed Follow-up ──────────────────────────────────────────────
+// ─── Handle Pending Follow-Up ────────────────────────────────────────────────
+
+export async function hasPendingFollowUp(
+  env: Env,
+  chatId: number,
+): Promise<ProactiveState["pendingFollowUp"] | undefined> {
+  const state = await getProactiveState(env, chatId);
+
+  if (!state.pendingFollowUp) return undefined;
+
+  // Check if the follow-up is still relevant
+  const msgCount = await getMessageCount(env, chatId);
+  if (msgCount > state.pendingFollowUp.bufferLengthAtSchedule + 3) {
+    // Convo moved on — clear
+    state.pendingFollowUp = undefined;
+    await saveProactiveState(env, chatId, state);
+    return undefined;
+  }
+
+  if (Date.now() < state.pendingFollowUp.scheduledAt) {
+    return undefined; // Not time yet
+  }
+
+  return state.pendingFollowUp;
+}
 
 export async function scheduleFollowUp(
   env: Env,
   chatId: number,
   topicSnapshot: string,
-  bufferLength: number,
+  delayMs: number = 15 * 60 * 1000,  // 15 minutes
 ): Promise<void> {
   const state = await getProactiveState(env, chatId);
+  const msgCount = await getMessageCount(env, chatId);
 
   state.pendingFollowUp = {
     topicSnapshot,
-    scheduledAt: Date.now() + (5 + Math.random() * 25) * 60 * 1000, // 5-30 min
-    bufferLengthAtSchedule: bufferLength,
+    scheduledAt: Date.now() + delayMs,
+    bufferLengthAtSchedule: msgCount,
   };
 
   await saveProactiveState(env, chatId, state);
-}
-
-// ─── Check if Follow-up is Still Relevant ────────────────────────────────────
-
-export async function checkPendingFollowUp(
-  env: Env,
-  chatId: number,
-): Promise<{ shouldSend: boolean; topicSnapshot?: string }> {
-  const state = await getProactiveState(env, chatId);
-  const followUp = state.pendingFollowUp;
-
-  if (!followUp) return { shouldSend: false };
-
-  // Not yet time
-  if (Date.now() < followUp.scheduledAt) return { shouldSend: false };
-
-  // Check if conversation moved on
-  const buffer = await getBuffer(env, chatId);
-  const newMessages = buffer.length - followUp.bufferLengthAtSchedule;
-
-  // If 5+ new messages since scheduling, topic probably moved on → skip
-  if (newMessages >= 5) {
-    state.pendingFollowUp = undefined;
-    await saveProactiveState(env, chatId, state);
-    return { shouldSend: false };
-  }
-
-  // Clear the follow-up
-  state.pendingFollowUp = undefined;
-  state.lastProactiveTs = Date.now();
-  await saveProactiveState(env, chatId, state);
-
-  return { shouldSend: true, topicSnapshot: followUp.topicSnapshot };
 }

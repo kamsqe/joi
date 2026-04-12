@@ -1,12 +1,12 @@
-// ─── User Name Resolution ────────────────────────────────────────────────────
-// Dynamic, KV-backed. VIP group members have pre-loaded defaults.
+// ─── User Name Resolution (D1-backed) ────────────────────────────────────────
+// Dynamic, D1-backed. VIP group members have pre-loaded defaults.
 
 import type { Env } from "./config";
 import { VIP_GROUP_ID, VIP_MEMBERS } from "./config";
 import { getProfile } from "./relationships";
 
 // ─── Resolve Display Name ────────────────────────────────────────────────────
-// Priority: KV nickname override → VIP default name → Telegram first_name → "Незнакомец"
+// Priority: D1 nickname override → VIP default name → Telegram first_name → "Незнакомец"
 
 export async function resolveUserName(
   env: Env,
@@ -85,24 +85,18 @@ export function isThirdPartyNicknameRequest(
 // ─── Register Active Chat ────────────────────────────────────────────────────
 
 export async function registerActiveChat(env: Env, chatId: number): Promise<void> {
-  const key = "chats:active";
-  try {
-    const raw = await env.KV.get(key);
-    const chats: number[] = raw ? JSON.parse(raw) : [];
-    if (!chats.includes(chatId)) {
-      chats.push(chatId);
-      await env.KV.put(key, JSON.stringify(chats));
-    }
-  } catch {
-    await env.KV.put(key, JSON.stringify([chatId]));
-  }
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO active_chats (chat_id, registered_at) VALUES (?, ?)`,
+  )
+    .bind(chatId, Date.now())
+    .run();
 }
 
 export async function getActiveChats(env: Env): Promise<number[]> {
-  try {
-    const raw = await env.KV.get("chats:active");
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
+  const rows = await env.DB.prepare(
+    `SELECT chat_id FROM active_chats`,
+  )
+    .all<{ chat_id: number }>();
+
+  return (rows.results || []).map((r) => r.chat_id);
 }

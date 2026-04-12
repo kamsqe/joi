@@ -1,8 +1,6 @@
-// ─── Reminder System ─────────────────────────────────────────────────────────
+// ─── Reminder System (D1-backed) ─────────────────────────────────────────────
 
 import type { Env, Reminder } from "./config";
-
-const REMINDER_TTL = 60 * 60 * 24 * 365; // 1 year max
 
 // ─── Create Reminder ─────────────────────────────────────────────────────────
 
@@ -26,13 +24,12 @@ export async function createReminder(
     createdAt: Date.now(),
   };
 
-  // Store the reminder
-  await env.KV.put(`rem:${id}`, JSON.stringify(reminder), {
-    expirationTtl: REMINDER_TTL,
-  });
-
-  // Add to chat index
-  await addToIndex(env, chatId, id);
+  await env.DB.prepare(
+    `INSERT INTO reminders (id, chat_id, user_id, description, remind_at, recurrence, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  )
+    .bind(id, chatId, userId, description, remindAt, reminder.recurrence, reminder.createdAt)
+    .run();
 
   return reminder;
 }
@@ -40,66 +37,62 @@ export async function createReminder(
 // ─── Get Reminders for Chat ──────────────────────────────────────────────────
 
 export async function getChatReminders(env: Env, chatId: number): Promise<Reminder[]> {
-  const ids = await getIndex(env, chatId);
-  const reminders: Reminder[] = [];
+  const rows = await env.DB.prepare(
+    `SELECT * FROM reminders WHERE chat_id = ?`,
+  )
+    .bind(chatId)
+    .all<{
+      id: string; chat_id: number; user_id: number; description: string;
+      remind_at: number; recurrence: string; created_at: number; last_reminded: number | null;
+    }>();
 
-  for (const id of ids) {
-    const raw = await env.KV.get(`rem:${id}`);
-    if (raw) {
-      reminders.push(JSON.parse(raw) as Reminder);
-    }
-  }
-
-  return reminders;
+  return (rows.results || []).map(rowToReminder);
 }
 
 // ─── Get Due Reminders (across all chats) ────────────────────────────────────
 
-export async function getDueReminders(env: Env, chatIds: number[]): Promise<Reminder[]> {
+export async function getDueReminders(env: Env): Promise<Reminder[]> {
   const now = Date.now();
-  const due: Reminder[] = [];
 
-  for (const chatId of chatIds) {
-    const reminders = await getChatReminders(env, chatId);
-    for (const r of reminders) {
-      if (r.remindAt <= now && (!r.lastReminded || now - r.lastReminded > 60000)) {
-        due.push(r);
-      }
-    }
-  }
+  const rows = await env.DB.prepare(
+    `SELECT * FROM reminders WHERE remind_at <= ? AND (last_reminded IS NULL OR ? - last_reminded > 60000)`,
+  )
+    .bind(now, now)
+    .all<{
+      id: string; chat_id: number; user_id: number; description: string;
+      remind_at: number; recurrence: string; created_at: number; last_reminded: number | null;
+    }>();
 
-  return due;
+  return (rows.results || []).map(rowToReminder);
 }
 
 // ─── Mark Reminded & Handle Recurrence ───────────────────────────────────────
 
 export async function processReminder(env: Env, reminder: Reminder): Promise<void> {
   if (reminder.recurrence === "once") {
-    // Delete one-time reminder
-    await env.KV.delete(`rem:${reminder.id}`);
-    await removeFromIndex(env, reminder.chatId, reminder.id);
+    await env.DB.prepare(`DELETE FROM reminders WHERE id = ?`).bind(reminder.id).run();
     return;
   }
 
   // Reschedule recurring reminder
   const nextTime = getNextOccurrence(reminder.remindAt, reminder.recurrence!);
-  reminder.remindAt = nextTime;
-  reminder.lastReminded = Date.now();
-
-  await env.KV.put(`rem:${reminder.id}`, JSON.stringify(reminder), {
-    expirationTtl: REMINDER_TTL,
-  });
+  await env.DB.prepare(
+    `UPDATE reminders SET remind_at = ?, last_reminded = ? WHERE id = ?`,
+  )
+    .bind(nextTime, Date.now(), reminder.id)
+    .run();
 }
 
 // ─── Delete Reminder ─────────────────────────────────────────────────────────
 
-export async function deleteReminder(env: Env, chatId: number, reminderId: string): Promise<boolean> {
-  const raw = await env.KV.get(`rem:${reminderId}`);
-  if (!raw) return false;
+export async function deleteReminder(env: Env, _chatId: number, reminderId: string): Promise<boolean> {
+  const result = await env.DB.prepare(
+    `DELETE FROM reminders WHERE id = ?`,
+  )
+    .bind(reminderId)
+    .run();
 
-  await env.KV.delete(`rem:${reminderId}`);
-  await removeFromIndex(env, chatId, reminderId);
-  return true;
+  return (result.meta?.changes ?? 0) > 0;
 }
 
 // ─── Find Reminder by Description (fuzzy) ────────────────────────────────────
@@ -109,46 +102,44 @@ export async function findReminderByDescription(
   chatId: number,
   searchText: string,
 ): Promise<Reminder | null> {
-  const reminders = await getChatReminders(env, chatId);
-  const lower = searchText.toLowerCase();
+  // Try SQL LIKE first
+  const row = await env.DB.prepare(
+    `SELECT * FROM reminders WHERE chat_id = ? AND description LIKE ? LIMIT 1`,
+  )
+    .bind(chatId, `%${searchText}%`)
+    .first<{
+      id: string; chat_id: number; user_id: number; description: string;
+      remind_at: number; recurrence: string; created_at: number; last_reminded: number | null;
+    }>();
 
-  // Simple substring match
-  for (const r of reminders) {
-    if (r.description.toLowerCase().includes(lower) || lower.includes(r.description.toLowerCase())) {
-      return r;
-    }
+  if (row) return rowToReminder(row);
+
+  // Fallback: reverse match (search text contains description)
+  const all = await getChatReminders(env, chatId);
+  const lower = searchText.toLowerCase();
+  for (const r of all) {
+    if (lower.includes(r.description.toLowerCase())) return r;
   }
 
   return null;
 }
 
-// ─── Chat Index Management ───────────────────────────────────────────────────
+// ─── Row → Reminder Mapper ───────────────────────────────────────────────────
 
-async function getIndex(env: Env, chatId: number): Promise<string[]> {
-  try {
-    const raw = await env.KV.get(`rem_idx:${chatId}`);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-async function addToIndex(env: Env, chatId: number, reminderId: string): Promise<void> {
-  const ids = await getIndex(env, chatId);
-  if (!ids.includes(reminderId)) {
-    ids.push(reminderId);
-    await env.KV.put(`rem_idx:${chatId}`, JSON.stringify(ids), {
-      expirationTtl: 60 * 60 * 24 * 90,
-    });
-  }
-}
-
-async function removeFromIndex(env: Env, chatId: number, reminderId: string): Promise<void> {
-  const ids = await getIndex(env, chatId);
-  const filtered = ids.filter((id) => id !== reminderId);
-  await env.KV.put(`rem_idx:${chatId}`, JSON.stringify(filtered), {
-    expirationTtl: 60 * 60 * 24 * 90,
-  });
+function rowToReminder(row: {
+  id: string; chat_id: number; user_id: number; description: string;
+  remind_at: number; recurrence: string; created_at: number; last_reminded: number | null;
+}): Reminder {
+  return {
+    id: row.id,
+    chatId: row.chat_id,
+    userId: row.user_id,
+    description: row.description,
+    remindAt: row.remind_at,
+    recurrence: row.recurrence as Reminder["recurrence"],
+    createdAt: row.created_at,
+    lastReminded: row.last_reminded || undefined,
+  };
 }
 
 // ─── Calculate Next Occurrence ───────────────────────────────────────────────

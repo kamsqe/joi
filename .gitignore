@@ -137,3 +137,22 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Test output
+tests/*_output.txt
+*.log
+
+# macOS
+.DS_Store
+
+# Exported Telegram logs (large, private)
+full vip group message logs/
+
+# One-off analysis scripts
+analyze_logs*.py
+
+# KV migration artifacts (contains chat IDs, user data)
+buf_keys.json
+user_keys.json
+vip_logs_sample.json
+seed.sql
