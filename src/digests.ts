@@ -5,6 +5,7 @@
 
 import type { Env, LLMMessage } from "./config";
 import { callLLMLight } from "./ai";
+import { trackLLMCall } from "./rate-limit";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -75,6 +76,7 @@ export interface StoredDigest {
 export async function shouldGenerateDigest(
   env: Env,
   chatId: number,
+  isPrivate: boolean = false,
 ): Promise<boolean> {
   // Check cooldown — last digest must be >30 min ago
   const lastDigest = await env.DB.prepare(
@@ -85,7 +87,7 @@ export async function shouldGenerateDigest(
     return false;
   }
 
-  // Check if there are enough new messages from 2+ users since last digest
+  // Check if there are enough new messages since last digest
   const sinceTs = lastDigest?.created_at || (Date.now() - SIX_HOURS_MS);
   const stats = await env.DB.prepare(
     `SELECT COUNT(*) as cnt, COUNT(DISTINCT user_id) as unique_users
@@ -96,6 +98,8 @@ export async function shouldGenerateDigest(
     .first<{ cnt: number; unique_users: number }>();
 
   if (!stats) return false;
+  // Private chats: only need message count threshold (always 1 user)
+  if (isPrivate) return stats.cnt >= MIN_MESSAGES_FOR_DIGEST;
   return stats.cnt >= MIN_MESSAGES_FOR_DIGEST && stats.unique_users >= MIN_UNIQUE_USERS;
 }
 
@@ -134,7 +138,15 @@ export async function generateAndStoreDigest(
 
   const userIds = [...new Set(messages.map(m => m.user_name))].join(", ");
 
-  const systemPrompt = `Ты помощник. Подведи КРАТКИЙ итог активности в групповом чате за недавний период.
+  const isPrivateChat = chatId > 0;
+  const systemPrompt = isPrivateChat
+    ? `Ты помощник. Подведи КРАТКИЙ итог недавнего разговора в личном чате.
+Отвечай ТОЛЬКО на русском языке.
+Формат: 1-2 предложения. Кратко, по делу. Не пиши "В чате обсуждалось..." — сразу суть.
+Упомяни основные темы. Примеры:
+- "обсуждали планы на выходные и новый проект"
+- "делился переживаниями из-за работы"`
+    : `Ты помощник. Подведи КРАТКИЙ итог активности в групповом чате за недавний период.
 Отвечай ТОЛЬКО на русском языке.
 Формат: 1-2 предложения. Кратко, по делу. Не пиши "В чате обсуждалось..." — сразу суть.
 Упомяни кто участвовал и о чём говорили. Если кто-то кидал статьи/новости которые никто не обсудил — отметь это.
@@ -147,9 +159,22 @@ export async function generateAndStoreDigest(
     { role: "user", content: `Сообщения в чате:\n${chatLines}\n\nУчастники: ${userIds}` },
   ];
 
-  const summary = await callLLMLight(env, llmMessages, systemPrompt, 100, 0.3);
+  // Give the model a bit more room — Russian summaries routinely run 200-300 chars.
+  const summary = await callLLMLight(env, llmMessages, systemPrompt, 160, 0.3);
+  await trackLLMCall(env);
 
-  if (!summary || summary.length < 10 || summary.length > 200) return;
+  if (!summary) {
+    console.log(JSON.stringify({ event: "digest_dropped", chatId, reason: "llm_null" }));
+    return;
+  }
+  if (summary.length < 10) {
+    console.log(JSON.stringify({ event: "digest_dropped", chatId, reason: "too_short", len: summary.length }));
+    return;
+  }
+  if (summary.length > 400) {
+    console.log(JSON.stringify({ event: "digest_dropped", chatId, reason: "too_long", len: summary.length, sample: summary.slice(0, 120) }));
+    return;
+  }
 
   // Store digest
   const now = Date.now();
@@ -165,6 +190,8 @@ export async function generateAndStoreDigest(
     periodEnd,
     now,
   ).run();
+
+  console.log(JSON.stringify({ event: "digest_written", chatId, len: summary.length, msgCount: messages.length }));
 
   // Prune old digests (keep last N)
   await env.DB.prepare(

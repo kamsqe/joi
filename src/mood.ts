@@ -242,8 +242,10 @@ export function isInCoolPeriod(mood: MoodData): boolean {
 export async function driftVolatility(env: Env, chatId: number): Promise<void> {
   const mood = await getMood(env, chatId);
 
-  const nudge = (Math.random() * 0.1 + 0.05) * (Math.random() < 0.5 ? -1 : 1);
-  mood.volatility = Math.max(0, Math.min(1, mood.volatility + nudge));
+  const target = 0.4;
+  const pull = (target - mood.volatility) * 0.15;
+  const noise = (Math.random() - 0.5) * 0.06;
+  mood.volatility = Math.max(0.05, Math.min(1, mood.volatility + pull + noise));
 
   if (mood.coolPeriodUntil && Date.now() > mood.coolPeriodUntil) {
     mood.mood = "annoyed";
@@ -272,8 +274,10 @@ export async function cronMoodShift(env: Env, chatId: number): Promise<void> {
     mood.lastChange = Date.now();
   }
 
-  const nudge = (Math.random() * 0.1 + 0.05) * (Math.random() < 0.5 ? -1 : 1);
-  mood.volatility = Math.max(0, Math.min(1, mood.volatility + nudge));
+  const target = 0.4;
+  const pull = (target - mood.volatility) * 0.15;
+  const noise = (Math.random() - 0.5) * 0.06;
+  mood.volatility = Math.max(0.05, Math.min(1, mood.volatility + pull + noise));
 
   await saveMood(env, chatId, mood);
 }

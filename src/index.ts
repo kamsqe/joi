@@ -5,16 +5,19 @@ import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID, VIP_PROACTIVE_TOPIC_ID, 
 import { parseUpdate, sendMessage, sendSticker, sendChatAction, setMessageReaction, formatForTelegram } from "./telegram";
 import { resolveUserName, registerActiveChat, getActiveChats, isFirstContact, isThirdPartyNicknameRequest } from "./users";
 import { saveUserMessage, saveBotMessage, pruneOldMessages } from "./context";
+import { detectCrisis, hasRecentCrisis, saveCrisisEvent } from "./crisis";
+import type { CrisisDetection } from "./crisis";
 import { buildSystemPrompt, buildProactiveSystemPrompt, chat, classifySentiment, batchAnalyzeMessage, detectNicknameRequest, detectReminderIntent, generateProactiveMessage } from "./ai";
 import { getMood, maybeSwingMood, shiftMoodBySentiment, setOffended, clearOffense, cronMoodShift } from "./mood";
 import { getProfile, saveProfile, adjustScore, setNickname, markFirstContactDone, updateSentimentAvg } from "./relationships";
 import { checkRateLimit, checkRPMThrottle, trackLLMCall, enterBlackout, getBlackoutState, pruneExpiredRateLimits } from "./rate-limit";
 import type { ThrottleLevel } from "./rate-limit";
-import { shouldSendProactive, markProactiveSent, hasPendingFollowUp, scheduleFollowUp } from "./proactive";
+import { shouldSendProactive, markProactiveSent, hasPendingFollowUp, scheduleFollowUp, selectProactiveStrategy, getStrategyHint } from "./proactive";
 import { createReminder, getChatReminders, getDueReminders, processReminder, parseRelativeTime, computeReminderDates, findReminderByDescription } from "./reminders";
 import { pickStickerForMood, extractStickerTag } from "./stickers";
 import { getFacts, extractAndSaveFacts, getRecentActiveFacts, saveBatchFacts } from "./facts";
 import { maybeBookmarkMoment, getEmotionalEvents } from "./memory";
+import { buildSocialGraph, computeChatMood } from "./social";
 import { shouldGenerateDigest, generateAndStoreDigest, pruneOldDigests } from "./digests";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
@@ -32,6 +35,11 @@ export default {
         ctx.waitUntil(
           handleMessage(env, ctx, update.message)
             .catch(err => console.error("[FATAL] handleMessage crashed:", err))
+        );
+      } else if (update?.edited_message) {
+        ctx.waitUntil(
+          handleEditedMessage(env, update.edited_message)
+            .catch(err => console.error("[FATAL] handleEditedMessage crashed:", err))
         );
       }
 
@@ -91,10 +99,17 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
   // Resolve user name
   const userName = await resolveUserName(env, chatId, userId, firstName);
 
-  // Build display text for buffer (include media marker if present)
-  const bufferText = hasMedia
+  // A2: Extract quote text (user selected specific text when replying)
+  const quoteText = message.quote?.text || null;
+
+  // Build display text for buffer (include media marker + quote if present)
+  let bufferText = hasMedia
     ? (text ? `[${mediaType}] ${text}` : `[Отправил ${mediaType}]`)
     : text;
+  // Prepend quote context so LLM sees what was specifically cited
+  if (quoteText) {
+    bufferText = `[цитата: "${quoteText.slice(0, 200)}"] ${bufferText}`;
+  }
 
   // Extract forward/reply metadata for D1 context builder
   const isForwarded = !!(message.forward_from_chat || message.forward_from || message.forward_sender_name);
@@ -113,18 +128,101 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
     forwardSource,
     replyToMessageId: replyToMsgId,
     threadId: threadId || null,
+    quoteText,
   };
 
+  // ─── Crisis Detection ────────────────────────────────────────────────────
+  // Run before shouldReply so concern/crisis can force active response even if
+  // the bot wasn't addressed directly. Skip for forwarded content (articles
+  // about depression, etc. shouldn't trigger false positives).
+  let crisis: CrisisDetection = { severity: "none", markers: [], confidence: "high", isJoking: false };
+  if (text && !isForwarded && text.length >= 3) {
+    try {
+      crisis = await detectCrisis(env, text);
+    } catch (err) {
+      console.error("[crisis] detection failed:", err);
+    }
+  }
+  const hasCrisis = crisis.severity === "concern" || crisis.severity === "crisis";
+
   // Determine if bot should respond
-  const shouldReply = isPrivate || shouldRespondInGroup(message, text);
+  // Crisis/concern forces active response even if not addressed (passive crisis)
+  const normallyShouldReply = isPrivate || shouldRespondInGroup(message, text);
+  const shouldReply = normallyShouldReply || hasCrisis;
+
+  // C: Log crisis detection events (any non-none severity)
+  if (crisis.severity !== "none") {
+    console.log(JSON.stringify({
+      event: "crisis_detected",
+      chatId,
+      userId,
+      severity: crisis.severity,
+      confidence: crisis.confidence,
+      markers: crisis.markers.slice(0, 3),
+      isJoking: crisis.isJoking,
+      forceActive: !normallyShouldReply && hasCrisis,
+      rustemBypass: userId === RUSTEM_USER_ID && chatId === VIP_GROUP_ID && hasCrisis,
+    }));
+  }
 
   if (!shouldReply) {
     // Save to D1 immediately for passive messages (won't cause duplication since no LLM call)
     if (bufferText) ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
 
-    // Extract facts for passive messages (separate call, non-blocking)
-    if (text && text.length >= 25) {
+    // G2: Sample qualifying passive messages for full sentiment+facts analysis.
+    // Without this, VIP sentimentAvg freezes (90%+ messages are passive, never sampled).
+    // When sampled, we get sentiment (updates relationship) AND facts in one LLM call.
+    // Bumped from len>=15 / 10% to len>=12 / 20% — month of prod showed only 11 facts
+    // saved across 2 users, undersampling was starving memory.
+    const shouldSample = text && text.length >= 12 && Math.random() < 0.2;
+    if (shouldSample && text) {
+      const repliedToBotPassive = message.reply_to_message?.from?.username === BOT_USERNAME;
+      const botMsgIdPassive = repliedToBotPassive ? message.reply_to_message?.message_id : undefined;
+      ctx.waitUntil(
+        batchAnalyzeMessage(env, text).then(async (result) => {
+          await trackLLMCall(env);
+          // Update sentimentAvg (passive signal into relationship)
+          if (result.sentiment.sentiment !== "neutral") {
+            await updateSentimentAvg(env, chatId, userId, result.sentiment.sentiment);
+          }
+          // Save facts if any extracted
+          if (result.facts.length > 0) {
+            await saveBatchFacts(env, chatId, userId, result.facts);
+          }
+          // Bookmark life events / strong emotions from passive messages too —
+          // gate is inside maybeBookmarkMoment (delta OR life-event keyword).
+          if (text && text.length >= 6) {
+            await maybeBookmarkMoment(env, chatId, userId, text, result.sentiment.sentiment, result.sentiment.delta)
+              .catch((e) => console.error("[BG] passive bookmark:", e));
+          }
+          // D: Quality feedback when sampled passive is a reply to Joi's message
+          if (repliedToBotPassive && result.sentiment.delta !== 0) {
+            console.log(JSON.stringify({
+              event: "quality_feedback",
+              chatId,
+              userId,
+              botMessageId: botMsgIdPassive ?? null,
+              userSentiment: result.sentiment.sentiment,
+              userDelta: result.sentiment.delta,
+              passive: true,
+            }));
+          }
+        }).catch((e) => console.error("[BG] passive batch analyze:", e)),
+      );
+    } else if (text && text.length >= 25) {
+      // Non-sampled: facts only (existing behavior)
       ctx.waitUntil(extractAndSaveFacts(env, chatId, userId, text).catch(e => console.error("[BG] extractFacts:", e)));
+    }
+
+    // Cheap life-event keyword check on EVERY passive message — bypasses the
+    // 20% sample gate so we don't miss "развожусь" / "повысили" mentions just
+    // because the dice roll went the other way. maybeBookmarkMoment handles
+    // the LLM call internally only when the regex actually matches.
+    if (text && text.length >= 6) {
+      ctx.waitUntil(
+        maybeBookmarkMoment(env, chatId, userId, text, "neutral", 0)
+          .catch((e) => console.error("[BG] passive life-event bookmark:", e))
+      );
     }
 
     // Passive processing: mood swing chance, spontaneous reactions
@@ -170,7 +268,7 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
     const bareResponses = ["ау?", "ау", "да?", "че", "м?", "слушаю", "хм?", "ну?"];
     const pick = bareResponses[Math.floor(Math.random() * bareResponses.length)];
     const sent = await sendMessage(env, chatId, pick, messageId, threadId);
-    ctx.waitUntil(saveBotMessage(env, chatId, pick, sent?.message_id));
+    ctx.waitUntil(saveBotMessage(env, chatId, pick, sent?.message_id, threadId));
     return;
   }
 
@@ -181,22 +279,35 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
   if (!effectiveText) return;
 
   // ─── Rustem Mode (VIP group only) ────────────────────────────────────────
+  // Crisis/concern bypasses Rustem Mode entirely — she should never be cold
+  // to someone in genuine distress, even if that someone is Rustem.
   if (userId === RUSTEM_USER_ID && chatId === VIP_GROUP_ID) {
-    const rustemResult = await handleRustemMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, throttle);
-    if (rustemResult) return; // handled (skipped or passive-aggressive reply sent)
+    // Save Rustem's message before handling so it's in context regardless of skip
+    if (bufferText) ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
+    if (!hasCrisis) {
+      const rustemResult = await handleRustemMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, throttle);
+      if (rustemResult) return; // handled (skipped or passive-aggressive reply sent)
+    }
+    // If crisis → fall through to normal active path (with crisis block injected)
   }
 
   // Save user message to D1 BEFORE the LLM call, but AFTER context is built.
   // For private chats: we must save AFTER buildPrivateContext to avoid duplication.
   // For group chats: the layered context builder uses separate layers, so saving first is fine.
   // Solution: save for group chats now, defer for private chats (handleActiveMessage does it).
-  if (!isPrivate && bufferText) {
+  // (Rustem's message already saved above to avoid loss on skip)
+  if (!isPrivate && bufferText && !(userId === RUSTEM_USER_ID && chatId === VIP_GROUP_ID)) {
     ctx.waitUntil(saveUserMessage(env, chatId, userId, userName, bufferText, saveOpts));
+  }
+
+  // Crisis event storage — dedupes by last-hour check internally
+  if (hasCrisis) {
+    ctx.waitUntil(saveCrisisEvent(env, chatId, userId, crisis).catch((e) => console.error("[crisis] save event:", e)));
   }
 
   // Active response path
   try {
-    await handleActiveMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, isPrivate, throttle, bufferText, saveOpts);
+    await handleActiveMessage(env, ctx, chatId, chatType, messageId, userId, userName, effectiveText, message, threadId, isPrivate, throttle, bufferText, saveOpts, crisis);
   } catch (err) {
     console.error("Message handling error:", err);
     // Make sure message is saved even on error
@@ -212,6 +323,24 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
     const pick = errorResponses[Math.floor(Math.random() * errorResponses.length)];
     await sendMessage(env, chatId, pick, messageId, threadId);
   }
+}
+
+// ─── Edited Message Handler (A3) ──────────────────────────────────────────────
+// When a user edits a message, silently update it in D1 so context stays accurate.
+// No LLM call, no response — just keep the DB in sync.
+
+async function handleEditedMessage(env: Env, message: TelegramMessage): Promise<void> {
+  const chatId = message.chat.id;
+  const messageId = message.message_id;
+  const newText = message.text?.trim() || message.caption?.trim() || "";
+
+  if (!newText || !messageId) return;
+
+  await env.DB.prepare(
+    `UPDATE messages SET content = ? WHERE chat_id = ? AND message_id = ?`,
+  )
+    .bind(newText, chatId, messageId)
+    .run();
 }
 
 // ─── Detect Media Type ────────────────────────────────────────────────────────
@@ -315,6 +444,7 @@ async function handleActiveMessage(
   throttle: ThrottleLevel = "normal",
   bufferText?: string,
   saveOpts?: import("./context").SaveMessageOptions,
+  crisis?: CrisisDetection,
 ): Promise<void> {
   const text = stripBotMention(rawText);
 
@@ -387,8 +517,10 @@ async function handleActiveMessage(
     }
   }
 
-  // Bookmark significant emotional moments (non-blocking)
-  if (Math.abs(sentimentResult.delta) >= 5) {
+  // Bookmark significant emotional moments (non-blocking).
+  // Always call when we have ANY text — the gate is inside maybeBookmarkMoment
+  // (sentiment delta OR life-event keyword). Cheap regex pre-pass avoids LLM.
+  if (text && text.length >= 6) {
     ctx.waitUntil(
       maybeBookmarkMoment(env, chatId, userId, text, sentimentResult.sentiment, sentimentResult.delta)
         .catch(e => console.error("[BG] bookmark:", e))
@@ -439,7 +571,7 @@ async function handleActiveMessage(
       ensureSaved();
       await setNickname(env, chatId, userId, possibleName);
       const systemPrompt = buildSystemPrompt(mood, profile, possibleName, chatType as any, chatId, { currentUserId: userId });
-      const response = await chat(env, `[Новый знакомый представился: "${possibleName}"]. Приветливо поздоровайся, используй имя, скажи что-нибудь приятное. Будь тёплой и дружелюбной.`, possibleName, systemPrompt, chatId);
+      const response = await chat(env, `[Новый знакомый представился: "${possibleName}"]. Приветливо поздоровайся, используй имя, скажи что-нибудь приятное. Будь тёплой и дружелюбной.`, possibleName, systemPrompt, chatId, null, userId, null, threadId);
       if (response) await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
       return;
     }
@@ -451,7 +583,7 @@ async function handleActiveMessage(
   if (isThirdPartyNicknameRequest(text, userId, chatId)) {
     ensureSaved();
     const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { currentUserId: userId });
-    const response = await chat(env, `[${userName} пытается изменить чужое имя]: ${text}\n\n(Откажи мягко, скажи "пусть сам попросит" в своём стиле)`, userName, systemPrompt, chatId);
+    const response = await chat(env, `[${userName} пытается изменить чужое имя]: ${text}\n\n(Откажи мягко, скажи "пусть сам попросит" в своём стиле)`, userName, systemPrompt, chatId, null, userId, null, threadId);
     if (response) {
       await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
     }
@@ -464,7 +596,7 @@ async function handleActiveMessage(
     ensureSaved();
     await setNickname(env, chatId, userId, nicknameRequest);
     const systemPrompt = buildSystemPrompt(mood, profile, nicknameRequest, chatType as any, chatId, { currentUserId: userId });
-    const response = await chat(env, `[Пользователь попросил называть его "${nicknameRequest}"]. Подтверди что будешь так называть, скажи что-нибудь милое/игривое про новое имя.`, nicknameRequest, systemPrompt, chatId);
+    const response = await chat(env, `[Пользователь попросил называть его "${nicknameRequest}"]. Подтверди что будешь так называть, скажи что-нибудь милое/игривое про новое имя.`, nicknameRequest, systemPrompt, chatId, null, userId, null, threadId);
     if (response) {
       await sendAndSave(env, ctx, chatId, response, messageId, threadId, mood);
     }
@@ -495,20 +627,29 @@ async function handleActiveMessage(
   // ─── Default: Chat ───────────────────────────────────────────────────────
 
   const startChat = Date.now();
-  const facts = await getFacts(env, chatId, userId);
-  const emotionalEvents = await getEmotionalEvents(env, chatId, userId);
+  // Load social intelligence + chat mood for VIP only (cost-gated — extra SQL).
+  const isVip = chatId === VIP_GROUP_ID;
+  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood] = await Promise.all([
+    getFacts(env, chatId, userId),
+    getEmotionalEvents(env, chatId, userId),
+    hasRecentCrisis(env, chatId, userId),
+    isVip ? buildSocialGraph(env, chatId, 7) : Promise.resolve([]),
+    isVip ? computeChatMood(env, chatId, 48) : Promise.resolve(null),
+  ]);
   // Compute days since last message for rare speaker detection
   const daysSinceLastMessage = profile.lastInteraction
     ? Math.floor((Date.now() - profile.lastInteraction) / 86_400_000)
     : undefined;
-  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage });
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage, crisis, recentCrisis, socialGraph, chatMood });
 
   // Send "typing" indicator before LLM call
   await sendChatAction(env, chatId, "typing", threadId);
 
   // The layered context builder in chat() handles reply chains via D1 thread walking
   const replyToMsgIdForContext = message.reply_to_message?.message_id || null;
-  const response = await chat(env, text, userName, systemPrompt, chatId, replyToMsgIdForContext, userId);
+  // A4: Pass reply text as fallback for when thread walker can't find the message in DB
+  const replyFallbackText = message.reply_to_message?.text || message.reply_to_message?.caption || null;
+  const response = await chat(env, text, userName, systemPrompt, chatId, replyToMsgIdForContext, userId, replyFallbackText, threadId);
   ctx.waitUntil(trackLLMCall(env));
 
   // Save user message to D1 AFTER context is built (prevents duplication in private chat context)
@@ -534,6 +675,7 @@ async function handleActiveMessage(
     chatId,
     userId,
     chatType: isPrivate ? "private" : "group",
+    threadId: threadId ?? null,
     mood: mood.mood,
     moodI: mood.intensity,
     sentiment: sentimentResult.sentiment,
@@ -541,9 +683,35 @@ async function handleActiveMessage(
     score: profile.score,
     sentAvg: Math.round(profile.sentimentAvg * 100) / 100,
     facts: facts.length,
+    emoEvents: emotionalEvents.length,
+    crisisSeverity: crisis?.severity ?? "none",
+    recentCrisis: !!recentCrisis,
+    socialEdges: socialGraph.length,
     responded: !!response,
     latency: Date.now() - startChat,
   }));
+
+  // ─── Quality Feedback Signal ─────────────────────────────────────────────
+  // If the user replied to Joi's message, their sentiment is feedback on how
+  // well she handled the previous turn. Log so we can aggregate later.
+  const repliedToBot = message.reply_to_message?.from?.username === BOT_USERNAME;
+  if (repliedToBot && sentimentResult.delta !== 0) {
+    const botMsgId = message.reply_to_message?.message_id;
+    const botMsgTs = botMsgId
+      ? await env.DB.prepare(
+          `SELECT ts FROM messages WHERE chat_id = ? AND message_id = ? AND role = 'assistant' LIMIT 1`,
+        ).bind(chatId, botMsgId).first<{ ts: number }>()
+      : null;
+    console.log(JSON.stringify({
+      event: "quality_feedback",
+      chatId,
+      userId,
+      botMessageId: botMsgId ?? null,
+      userSentiment: sentimentResult.sentiment,
+      userDelta: sentimentResult.delta,
+      replyLatencyMs: botMsgTs ? Date.now() - botMsgTs.ts : null,
+    }));
+  }
 }
 
 // ─── Send Response + Handle Stickers + Message Splitting ─────────────────────
@@ -597,7 +765,7 @@ async function sendAndSave(
       threadId,
     );
     if (sent) {
-      ctx.waitUntil(saveBotMessage(env, chatId, parts[i], sent.message_id));
+      ctx.waitUntil(saveBotMessage(env, chatId, parts[i], sent.message_id, threadId));
     }
   }
 
@@ -644,7 +812,7 @@ async function handleFirstContact(
   const greeting = "Привет! 😊 Я Джой. Как мне тебя называть?";
   const sent = await sendMessage(env, chatId, greeting, messageId, threadId);
   // Save greeting to D1 so context builder can see it
-  await saveBotMessage(env, chatId, greeting, sent?.message_id);
+  await saveBotMessage(env, chatId, greeting, sent?.message_id, threadId);
 }
 
 // ─── Help ────────────────────────────────────────────────────────────────────
@@ -812,6 +980,62 @@ function extractCommand(text: string): { name: string; args: string } | null {
   };
 }
 
+// ─── Proactive Context Loader ────────────────────────────────────────────────
+// Loads all context needed for a proactive message (facts, emotional events,
+// digests, recent chat messages, crisis recency). Works for both private and
+// group chats. Used by both follow-up and random-proactive branches of cron.
+
+async function loadProactiveContext(
+  env: Env,
+  chatId: number,
+  targetUserId: number,
+  isPrivate: boolean,
+): Promise<{
+  facts: string[];
+  emotionalEvents: Awaited<ReturnType<typeof getEmotionalEvents>>;
+  recentCrisis: boolean;
+  activityDigest?: string;
+  latestDigest?: string;
+  recentMessages?: string;
+  socialGraph: Awaited<ReturnType<typeof buildSocialGraph>>;
+  chatMood: Awaited<ReturnType<typeof computeChatMood>>;
+}> {
+  const isVip = chatId === VIP_GROUP_ID;
+  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood] = await Promise.all([
+    isPrivate ? getFacts(env, chatId, targetUserId) : getRecentActiveFacts(env, chatId),
+    // For private: per-user events. For groups: load for userId=0 (synthetic "chat-wide" bucket,
+    // will return empty since events are saved per real user — but keeps types consistent).
+    isPrivate ? getEmotionalEvents(env, chatId, targetUserId) : Promise.resolve([]),
+    isPrivate ? hasRecentCrisis(env, chatId, targetUserId) : Promise.resolve(false),
+    isVip ? buildSocialGraph(env, chatId, 7) : Promise.resolve([]),
+    isVip ? computeChatMood(env, chatId, 48) : Promise.resolve(null),
+  ]);
+
+  // Digests + recent messages: now loaded for BOTH private and group chats (G3 fix)
+  const { buildActivityDigest, loadRecentDigests, formatDigestsForPrompt } = await import("./digests");
+  const [activityDigest, latestDigest, recentRows] = await Promise.all([
+    buildActivityDigest(env, chatId).then((d) => d || undefined),
+    loadRecentDigests(env, chatId, 1).then((d) => formatDigestsForPrompt(d) || undefined),
+    env.DB.prepare(
+      `SELECT user_name, content FROM messages
+       WHERE chat_id = ? AND role = 'user' AND is_bot = 0 AND is_forwarded = 0
+       ORDER BY ts DESC LIMIT 8`,
+    )
+      .bind(chatId)
+      .all<{ user_name: string; content: string }>(),
+  ]);
+
+  let recentMessages: string | undefined;
+  if (recentRows.results && recentRows.results.length > 0) {
+    const lines = recentRows.results.reverse().map(
+      (m) => `[${m.user_name || "?"}]: ${m.content.slice(0, 150)}`,
+    );
+    recentMessages = `ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ (для контекста, чтобы ты не писала невпопад):\n${lines.join("\n")}`;
+  }
+
+  return { facts, emotionalEvents, recentCrisis, activityDigest, latestDigest, recentMessages, socialGraph, chatMood };
+}
+
 // ─── Cron Handler ────────────────────────────────────────────────────────────
 
 async function handleCron(env: Env): Promise<void> {
@@ -827,12 +1051,12 @@ async function handleCron(env: Env): Promise<void> {
     // 1. Drift mood + volatility
     await cronMoodShift(env, chatId);
 
-    // 1b. Generate conversation digest for group chats (RPM-guarded)
+    // 1b. Generate conversation digest (RPM-guarded) — for both group and private chats
     const isGroupChat = chatId < 0;
-    if (isGroupChat) {
+    {
       const throttle = await checkRPMThrottle(env);
-      if (throttle !== "block") {
-        const needsDigest = await shouldGenerateDigest(env, chatId);
+      if (throttle !== "blackout") {
+        const needsDigest = await shouldGenerateDigest(env, chatId, !isGroupChat);
         if (needsDigest) {
           await generateAndStoreDigest(env, chatId);
         }
@@ -841,6 +1065,7 @@ async function handleCron(env: Env): Promise<void> {
 
     // 2. Check pending follow-ups
     const proactiveTopicId = chatId === VIP_GROUP_ID ? VIP_PROACTIVE_TOPIC_ID : undefined;
+    const almatyHourNow = (new Date().getUTCHours() + 5) % 24;
     const followUp = await hasPendingFollowUp(env, chatId);
     if (followUp) {
       const mood = await getMood(env, chatId);
@@ -848,31 +1073,51 @@ async function handleCron(env: Env): Promise<void> {
       const followUpUserId = isPrivateChat ? chatId : 0;
       const profile = await getProfile(env, chatId, followUpUserId);
       const chatType = isPrivateChat ? "private" : "supergroup";
-      const facts = isPrivateChat ? await getFacts(env, chatId, followUpUserId) : await getRecentActiveFacts(env, chatId);
-      // Load digest context for group proactive messages
-      let activityDigest: string | undefined;
-      let latestDigest: string | undefined;
-      if (!isPrivateChat) {
-        const { buildActivityDigest, loadRecentDigests, formatDigestsForPrompt } = await import("./digests");
-        activityDigest = (await buildActivityDigest(env, chatId)) || undefined;
-        const digests = await loadRecentDigests(env, chatId, 1);
-        latestDigest = formatDigestsForPrompt(digests) || undefined;
-      }
-      const systemPrompt = buildProactiveSystemPrompt(mood, profile, profile.nickname || "", chatType as any, chatId, { facts, activityDigest, latestDigest });
-      const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
+
+      const proactiveCtx = await loadProactiveContext(env, chatId, followUpUserId, isPrivateChat);
+
+      // Follow-up is always "reaction" — it's specifically continuing a conversation thread
+      const strategyHint = getStrategyHint("reaction");
+
+      const proactiveStartFollowUp = Date.now();
+      const systemPrompt = buildProactiveSystemPrompt(mood, profile, profile.nickname || "", chatType as any, chatId, {
+        facts: proactiveCtx.facts,
+        activityDigest: proactiveCtx.activityDigest,
+        latestDigest: proactiveCtx.latestDigest,
+        recentMessages: proactiveCtx.recentMessages,
+        emotionalEvents: proactiveCtx.emotionalEvents,
+        recentCrisis: proactiveCtx.recentCrisis,
+        strategyHint,
+        socialGraph: proactiveCtx.socialGraph,
+        chatMood: proactiveCtx.chatMood,
+      });
+      const response = await generateProactiveMessage(env, chatId, mood, systemPrompt, { threadId: proactiveTopicId });
+      await trackLLMCall(env);
       if (response) {
         const { cleanText } = extractStickerTag(response);
         if (cleanText) {
           await sendMessage(env, chatId, formatForTelegram(cleanText), undefined, proactiveTopicId);
-          await saveBotMessage(env, chatId, cleanText);
+          await saveBotMessage(env, chatId, cleanText, undefined, proactiveTopicId);
           await markProactiveSent(env, chatId);
+          // B: Log proactive sent
+          console.log(JSON.stringify({
+            event: "proactive_sent",
+            chatId,
+            threadId: proactiveTopicId ?? null,
+            strategy: "reaction",
+            isFollowUp: true,
+            silenceHours: null,
+            almatyHour: almatyHourNow,
+            mood: mood.mood,
+            responseLength: cleanText.length,
+            latency: Date.now() - proactiveStartFollowUp,
+          }));
         }
       }
     }
 
     // 3. Random proactive message (suppress at night 00:00-07:00 Almaty)
-    const almatyHour = (new Date().getUTCHours() + 5) % 24;
-    const isNight = almatyHour >= 0 && almatyHour < 7;
+    const isNight = almatyHourNow >= 0 && almatyHourNow < 7;
     const { should: shouldProactive } = await shouldSendProactive(env, chatId);
     if (!isNight && shouldProactive) {
       const mood = await getMood(env, chatId);
@@ -880,46 +1125,64 @@ async function handleCron(env: Env): Promise<void> {
       const proactiveUserId = isPrivate ? chatId : 0;
       const profile = await getProfile(env, chatId, proactiveUserId);
       const chatType = isPrivate ? "private" : "supergroup";
-      const facts = isPrivate ? await getFacts(env, chatId, proactiveUserId) : await getRecentActiveFacts(env, chatId);
-      // Load digest context for group proactive messages
-      let activityDigest: string | undefined;
-      let latestDigest: string | undefined;
-      let recentMessages: string | undefined;
-      if (!isPrivate) {
-        const { buildActivityDigest, loadRecentDigests, formatDigestsForPrompt } = await import("./digests");
-        activityDigest = (await buildActivityDigest(env, chatId)) || undefined;
-        const digests = await loadRecentDigests(env, chatId, 1);
-        latestDigest = formatDigestsForPrompt(digests) || undefined;
 
-        // Load recent messages so proactive messages reference actual conversation
-        const recentRows = await env.DB.prepare(
-          `SELECT user_name, content FROM messages
-           WHERE chat_id = ? AND role = 'user' AND is_bot = 0 AND is_forwarded = 0
-           ORDER BY ts DESC LIMIT 8`,
-        )
-          .bind(chatId)
-          .all<{ user_name: string; content: string }>();
+      const proactiveCtx = await loadProactiveContext(env, chatId, proactiveUserId, isPrivate);
 
-        if (recentRows.results && recentRows.results.length > 0) {
-          const lines = recentRows.results.reverse().map(
-            (m) => `[${m.user_name || "?"}]: ${m.content.slice(0, 150)}`
-          );
-          recentMessages = `ПОСЛЕДНИЕ СООБЩЕНИЯ В ЧАТЕ (для контекста, чтобы ты не писала невпопад):\n${lines.join("\n")}`;
-        }
-      }
-      const systemPrompt = buildProactiveSystemPrompt(mood, profile, profile.nickname || "", chatType, chatId, { facts, activityDigest, latestDigest, recentMessages });
-      const response = await generateProactiveMessage(env, chatId, mood, systemPrompt);
+      // Compute silence for strategy selection
+      const { getLastUserMessageTs } = await import("./context");
+      const lastUserTs = await getLastUserMessageTs(env, chatId);
+      const silenceHours = lastUserTs ? (Date.now() - lastUserTs) / (1000 * 60 * 60) : 0;
+
+      // C5+C7+C9: Select strategy based on context (time, mood, silence, emotional history)
+      const strategy = selectProactiveStrategy({
+        silenceHours,
+        almatyHour: almatyHourNow,
+        hasRecentCrisis: proactiveCtx.recentCrisis,
+        hasEmotionalBookmarks: proactiveCtx.emotionalEvents.length > 0,
+        moodState: mood.mood,
+        isPrivate,
+      });
+      const strategyHint = getStrategyHint(strategy);
+
+      const proactiveStartRandom = Date.now();
+      const systemPrompt = buildProactiveSystemPrompt(mood, profile, profile.nickname || "", chatType, chatId, {
+        facts: proactiveCtx.facts,
+        activityDigest: proactiveCtx.activityDigest,
+        latestDigest: proactiveCtx.latestDigest,
+        recentMessages: proactiveCtx.recentMessages,
+        emotionalEvents: proactiveCtx.emotionalEvents,
+        recentCrisis: proactiveCtx.recentCrisis,
+        strategyHint,
+        socialGraph: proactiveCtx.socialGraph,
+        chatMood: proactiveCtx.chatMood,
+      });
+      const response = await generateProactiveMessage(env, chatId, mood, systemPrompt, { threadId: proactiveTopicId });
+      await trackLLMCall(env);
       if (response) {
         const { cleanText, emotion } = extractStickerTag(response);
         if (cleanText) {
           await sendMessage(env, chatId, formatForTelegram(cleanText), undefined, proactiveTopicId);
-          await saveBotMessage(env, chatId, cleanText);
+          await saveBotMessage(env, chatId, cleanText, undefined, proactiveTopicId);
         }
         if (emotion && chatId === VIP_GROUP_ID) {
           const sticker = pickStickerForMood(emotion as any);
           if (sticker) await sendSticker(env, chatId, sticker.fileId, undefined, proactiveTopicId);
         }
         await markProactiveSent(env, chatId);
+        // B: Log proactive sent
+        console.log(JSON.stringify({
+          event: "proactive_sent",
+          chatId,
+          threadId: proactiveTopicId ?? null,
+          strategy,
+          isFollowUp: false,
+          silenceHours: Math.round(silenceHours * 10) / 10,
+          almatyHour: almatyHourNow,
+          mood: mood.mood,
+          responseLength: cleanText?.length ?? 0,
+          hasEmotion: !!emotion,
+          latency: Date.now() - proactiveStartRandom,
+        }));
       }
     }
     } catch (err) {
@@ -942,6 +1205,7 @@ async function handleCron(env: Env): Promise<void> {
         `[НАПОМИНАНИЕ для ${userName}: "${reminder.description}"]. Напомни в своём стиле, обращаясь к ${userName}.`,
         userName, systemPrompt, reminder.chatId,
       );
+      await trackLLMCall(env);
 
       if (response) {
         await sendMessage(env, reminder.chatId, formatForTelegram(response));
@@ -1050,7 +1314,7 @@ async function handleRustemMessage(
   if (Math.random() < 0.75) {
     const pick = RUSTEM_PASSIVE_RESPONSES[Math.floor(Math.random() * RUSTEM_PASSIVE_RESPONSES.length)];
     await sendMessage(env, chatId, pick, messageId, threadId);
-    ctx.waitUntil(saveBotMessage(env, chatId, pick));
+    ctx.waitUntil(saveBotMessage(env, chatId, pick, undefined, threadId));
     return true;
   }
 

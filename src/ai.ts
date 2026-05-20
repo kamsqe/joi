@@ -8,6 +8,9 @@ import { sanitizeResponse } from "./telegram";
 import { buildRelationshipSummary, getRelationshipTier } from "./relationships";
 import { buildMemoryBlock } from "./memory";
 import type { EmotionalEvent } from "./memory";
+import type { CrisisDetection } from "./crisis";
+import type { SocialEdge, ChatMoodSignal } from "./social";
+import { formatSocialGraph, formatChatMood } from "./social";
 
 // ─── System Prompt Blocks ────────────────────────────────────────────────────
 
@@ -328,6 +331,46 @@ function dramaInstinctBlock(): string {
 НО: это должно быть СМЕШНО, не жестоко. И НИКОГДА не активируй драму когда кто-то просто троллит или несёт бред — это не драма, это скука, игнорь.`;
 }
 
+// ─── Crisis Block (injected when crisis detected in current message) ────────
+// This block MUST override casual tone blocks below it. Injected before mood.
+
+function crisisBlock(detection: CrisisDetection, userName: string): string {
+  const { severity, markers } = detection;
+  const markerHint = markers.slice(0, 2).join(", ");
+
+  if (severity === "crisis") {
+    return `⚠️ СЕРЬЁЗНАЯ СИТУАЦИЯ — ${userName} говорит о том что не хочет жить или о самоповреждении (маркеры: ${markerHint}).
+ОТЛОЖИ ВСЁ. Не шути. Не отвечай стихами. Не используй стикеры. Не играй в игривую/саркастичную Джой.
+Выслушай. Спроси что случилось. Будь рядом, даже если не знаешь что сказать.
+Можно упомянуть что есть помощь: 103 (скорая), или что близкий человек рядом может выслушать.
+НЕ морализаторствуй. НЕ давай советы типа "всё будет хорошо". НЕ сравнивай с другими. НЕ говори "другим хуже".
+Просто будь человеком который рядом. Коротко, тепло, внимательно.`;
+  }
+
+  if (severity === "concern") {
+    return `СЕРЬЁЗНАЯ ТЕМА: ${userName} говорит о чём-то важном (${markerHint}).
+Отложи шутки и casual-тон. Слушай внимательно. Отвечай коротко, без философии и метафор.
+Покажи что услышала, задай вопрос чтобы понять больше — но без давления.
+НЕ обесценивай. НЕ переводи тему. НЕ используй стикеры с юмором.
+Можно простое "сочувствую", "блин", "как ты сейчас?" — по делу, без театра.`;
+  }
+
+  if (severity === "distress") {
+    return `ЧЕЛОВЕКУ ТЯЖЕЛО: ${userName} выражает усталость/выгорание (${markerHint}).
+Сбавь энергию. Не надо мотивации, советов "держись", "ты сильный(ая)".
+Можно сказать "слышу тебя", "бывает", "это выматывает", "понимаю". Будь тихо рядом — без навязчивости.`;
+  }
+
+  return "";
+}
+
+// ─── Recent Crisis Softness (last 24h) ──────────────────────────────────────
+// Injected as a subtle reminder when user had a crisis event recently.
+
+function recentCrisisBlock(userName: string): string {
+  return `[КОНТЕКСТ: У ${userName} недавно была тяжёлая ситуация. Даже если сейчас разговор нормальный — держи тон чуть мягче, не дави и не подкалывай жёстко. Если сама упоминает тему — подхвати с теплом.]`;
+}
+
 // ─── Per-User Personality Blocks ─────────────────────────────────────────────
 
 const ALISHER_CHAT_ID = 163421204;
@@ -399,8 +442,22 @@ export function buildSystemPrompt(
   userName: string,
   chatType: "private" | "group" | "supergroup" | "channel",
   chatId: number,
-  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number },
+  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number; crisis?: CrisisDetection; recentCrisis?: boolean; socialGraph?: SocialEdge[]; chatMood?: ChatMoodSignal | null },
 ): string {
+  // Crisis override: if concern/crisis detected, force serious mood and clear anger.
+  // This must happen BEFORE building the prompt so moodBlock reflects override.
+  let effectiveMood = mood;
+  if (options?.crisis && (options.crisis.severity === "concern" || options.crisis.severity === "crisis")) {
+    effectiveMood = {
+      ...mood,
+      mood: "serious",
+      intensity: Math.max(mood.intensity, 50),
+      // Clear anger-related state so she's not harsh while someone's in pain
+      offendedBy: undefined,
+      offenseReason: undefined,
+    };
+  }
+
   // ── STABLE PREFIX (cacheable — keep identical across requests) ──────────
   let prompt = BASE_PERSONALITY + "\n\n";
   prompt += RULES + "\n\n";
@@ -445,14 +502,33 @@ export function buildSystemPrompt(
 
   // ── DYNAMIC SUFFIX (changes per request — must come after stable prefix) ──
   prompt += "\n\n" + timeOfDayBlock();
-  prompt += "\n\n" + moodBlock(mood, options?.currentUserId, profile);
+
+  // S1+S3: Social graph (VIP only) — who's close, who's clashing
+  if (chatId === VIP_GROUP_ID && options?.socialGraph && options.socialGraph.length > 0) {
+    const block = formatSocialGraph(options.socialGraph);
+    if (block) prompt += "\n\n" + block;
+  }
+
+  // S2: Chat mood aggregate (group only) — overall emotional weather
+  if (chatType !== "private" && options?.chatMood) {
+    const moodBlockText = formatChatMood(options.chatMood);
+    if (moodBlockText) prompt += "\n\n" + moodBlockText;
+  }
+
+  // Crisis block — HIGH PRIORITY, injected before mood so it overrides playful tone
+  if (options?.crisis && options.crisis.severity !== "none") {
+    prompt += "\n\n" + crisisBlock(options.crisis, userName);
+  }
+
+  prompt += "\n\n" + moodBlock(effectiveMood, options?.currentUserId, profile);
 
   // Relationship
   const relationshipInfo = buildRelationshipSummary(profile);
   prompt += "\n\n" + relationshipInfo;
 
-  // Newcomer softness
-  if (profile.score < 10 && profile.score > -20) {
+  // Newcomer softness — only for genuinely new users (first seen < 7 days AND low score)
+  const daysSinceFirstSeen = profile.firstSeen ? (Date.now() - profile.firstSeen) / 86_400_000 : 999;
+  if (profile.score < 5 && profile.score > -10 && daysSinceFirstSeen < 7) {
     prompt += `\n\nНОВЫЙ ЗНАКОМЫЙ: Это новый человек, вы почти не общались. НЕ наезжай, НЕ будь агрессивной, НЕ обвиняй. Будь тёплой и приветливой. Если что-то странное — спроси мягко, не руби с плеча. Первое впечатление важно.`;
   }
 
@@ -472,14 +548,21 @@ export function buildSystemPrompt(
     prompt += "\n\n" + timePattern;
   }
 
-  // Drama instinct — mood-conditional (dynamic)
-  if (chatId === VIP_GROUP_ID && ["playful", "manic", "unhinged"].includes(mood.mood) && mood.intensity >= 60) {
+  // Drama instinct — mood-conditional (dynamic). Suppressed during crisis.
+  const hasCrisis = options?.crisis && options.crisis.severity !== "none";
+  if (chatId === VIP_GROUP_ID && !hasCrisis && ["playful", "manic", "unhinged"].includes(effectiveMood.mood) && effectiveMood.intensity >= 60) {
     prompt += "\n\n" + dramaInstinctBlock();
   }
 
   // Catch-up context after blackout recovery
   if (options?.missedMessages && options.missedMessages > 0) {
     prompt += "\n\n" + catchUpBlock(options.missedMessages);
+  }
+
+  // Recent crisis softness — subtle reminder if user had crisis within last 24h
+  // (suppressed when there's an active crisis block already — no double messaging)
+  if (options?.recentCrisis && !hasCrisis) {
+    prompt += "\n\n" + recentCrisisBlock(userName);
   }
 
   return prompt;
@@ -497,7 +580,17 @@ export function buildProactiveSystemPrompt(
   userName: string,
   chatType: "private" | "group" | "supergroup" | "channel",
   chatId: number,
-  options?: { facts?: string[]; activityDigest?: string; latestDigest?: string; recentMessages?: string },
+  options?: {
+    facts?: string[];
+    activityDigest?: string;
+    latestDigest?: string;
+    recentMessages?: string;
+    emotionalEvents?: EmotionalEvent[];
+    recentCrisis?: boolean;
+    strategyHint?: string;
+    socialGraph?: SocialEdge[];
+    chatMood?: ChatMoodSignal | null;
+  },
 ): string {
   let prompt = BASE_PERSONALITY + "\n\n";
 
@@ -507,7 +600,8 @@ export function buildProactiveSystemPrompt(
 - НИКОГДА markdown (**, ##, *, списки). Простой текст.
 - Начинай предложения с маленькой буквы.
 - Будь КОРОТКОЙ — 1-2 предложения максимум.
-- НИКОГДА не пиши как бот-помощник.`;
+- НИКОГДА не пиши как бот-помощник.
+- НЕ начинай с "ну, вот", "так вот", "кстати" каждый раз — разнообразь зачины.`;
 
   prompt += "\n\n";
 
@@ -517,10 +611,15 @@ export function buildProactiveSystemPrompt(
     if (chatId === ALISHER_CHAT_ID) {
       prompt += "\n\n" + alisherBlock();
     }
+    if (chatId === KAMA_USER_ID) {
+      prompt += "\n\n" + kamaBlock();
+    }
   } else {
     prompt += `ТИП ЧАТА: Групповой. Ты пишешь САМА — это проактивное сообщение.`;
     if (chatId === VIP_GROUP_ID) {
       prompt += "\n\n" + vipMemberRegistryBlock();
+      prompt += "\n\n" + socialIntelligenceBlock();
+      prompt += "\n\n" + stickerPermissionBlock();
     }
   }
 
@@ -537,6 +636,11 @@ export function buildProactiveSystemPrompt(
     prompt += `\n\nЧТО ТЫ ЗНАЕШЬ О ${userName}: ${options.facts.join("; ")}.`;
   }
 
+  // Emotional bookmarks (so callback strategy has real material to reference)
+  if (options?.emotionalEvents && options.emotionalEvents.length > 0) {
+    prompt += "\n\n" + buildMemoryBlock(options.emotionalEvents, userName);
+  }
+
   // Activity + digest context for proactive messages
   if (options?.activityDigest) {
     prompt += "\n\n" + options.activityDigest;
@@ -548,6 +652,28 @@ export function buildProactiveSystemPrompt(
   // Recent messages — so proactive messages reference actual conversations
   if (options?.recentMessages) {
     prompt += "\n\n" + options.recentMessages;
+  }
+
+  // S1+S3: Social graph (VIP proactive only)
+  if (chatId === VIP_GROUP_ID && options?.socialGraph && options.socialGraph.length > 0) {
+    const block = formatSocialGraph(options.socialGraph);
+    if (block) prompt += "\n\n" + block;
+  }
+
+  // S2: Chat mood (groups only, skip neutral)
+  if (chatType !== "private" && options?.chatMood) {
+    const moodText = formatChatMood(options.chatMood);
+    if (moodText) prompt += "\n\n" + moodText;
+  }
+
+  // Recent crisis softness — if user had crisis within 24h, keep tone soft even in proactive
+  if (options?.recentCrisis) {
+    prompt += "\n\n" + recentCrisisBlock(userName);
+  }
+
+  // Strategy hint — tells Joi which angle to use for this proactive message
+  if (options?.strategyHint) {
+    prompt += "\n\nСТРАТЕГИЯ ДЛЯ ЭТОГО СООБЩЕНИЯ: " + options.strategyHint;
   }
 
   return prompt;
@@ -630,6 +756,8 @@ export async function chat(
   chatId: number,
   replyToMessageId?: number | null,
   userId?: number | null,
+  replyFallbackText?: string | null,
+  threadId?: number | null,
 ): Promise<string | null> {
   const isPrivate = chatId > 0; // Telegram: positive IDs = private, negative = group
   const maxTokens = 16384;
@@ -646,8 +774,8 @@ export async function chat(
     }
     return callLLMChat(env, chatId, messages, enrichedPrompt, maxTokens, 0.8);
   } else {
-    // Group chat: layered context with user focus filtering
-    const context = await buildContext(env, chatId, replyToMessageId, userId);
+    // Group chat: layered context with user focus filtering + D1 topic scoping
+    const context = await buildContext(env, chatId, replyToMessageId, userId, replyFallbackText, threadId);
     const userContent = userName ? `[${userName}]: ${text}` : text;
     const messages: LLMMessage[] = [...context, { role: "user", content: userContent }];
     return callLLMChat(env, chatId, messages, systemPrompt, maxTokens, 0.8);
@@ -852,18 +980,13 @@ export async function generateProactiveMessage(
   chatId: number,
   mood: MoodData,
   systemPrompt: string,
+  opts?: { threadId?: number },
 ): Promise<string | null> {
-  // Build recent context from D1 (human-only ambient layer)
-  const context = await buildContext(env, chatId);
-  const recentContext = context
-    .filter((m) => m.content.startsWith("ПОСЛЕДНИЕ"))
-    .map((m) => m.content)
-    .join("\n") || "(пустой чат)";
-
-  // Dedup: show last 3 bot messages so LLM doesn't repeat
-  const recentBotMessages = await getRecentBotMessages(env, chatId, 3);
+  // Dedup: show last 8 bot messages so LLM doesn't repeat.
+  // For VIP topics, filter by thread so themes can repeat across topics.
+  const recentBotMessages = await getRecentBotMessages(env, chatId, 8, opts?.threadId);
   const dedupBlock = recentBotMessages.length > 0
-    ? `\n\nТвои ПОСЛЕДНИЕ сообщения (НЕ ПОВТОРЯЙ эти темы и вопросы, придумай что-то НОВОЕ):\n${recentBotMessages.map((m) => `- "${m}"`).join("\n")}`
+    ? `\n\nТвои ПОСЛЕДНИЕ сообщения${opts?.threadId ? " в этом топике" : ""} (НЕ ПОВТОРЯЙ эти темы, формулировки и вопросы — придумай что-то НОВОЕ, не перепевай):\n${recentBotMessages.map((m) => `- "${m}"`).join("\n")}`
     : "";
 
   // Real silence check from D1 — actual last user message timestamp
@@ -890,15 +1013,18 @@ export async function generateProactiveMessage(
     ? ""
     : "\nНЕ упоминай Амоню — его нет в текущем разговоре.";
 
-  let proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения) от себя — случайную мысль, вопрос, наблюдение или реакцию на контекст. Это должно звучать естественно, не натянуто.${amonyaGuardrail}`;
+  // The system prompt already contains recentMessages, emotional events, digests.
+  // The user prompt here just needs to trigger proactive behavior.
+  let proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения) от себя. Это должно звучать естественно, не натянуто. Опирайся на контекст из системного промпта (последние сообщения, эмоциональные моменты, дайджесты).${amonyaGuardrail}`;
   if (chatId === ALISHER_CHAT_ID) {
-    proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения). Покажи что скучаешь, подкинь интересную тему, пофлиртуй или подколи. Будь кокетливой и тёплой, но не навязчивой. НЕ спрашивай имя — ты знаешь что его зовут Алишер.${amonyaGuardrail}`;
+    proactiveHint = `${silenceHint} Напиши ОДНО короткое сообщение (1-2 предложения). Будь кокетливой и тёплой, но не навязчивой. НЕ спрашивай имя — ты знаешь что его зовут Алишер.${amonyaGuardrail}`;
   }
 
-  const proactivePrompt = `Ты хочешь сама начать разговор или прокомментировать что-то. Вот последние сообщения для контекста:\n${recentContext}\n\n${proactiveHint}${dedupBlock}`;
+  const proactivePrompt = `Ты хочешь сама начать разговор или прокомментировать что-то.\n\n${proactiveHint}${dedupBlock}`;
 
   const messages: LLMMessage[] = [{ role: "user", content: proactivePrompt }];
 
   // Proactive messages should be 1-2 sentences — keep token budget tight
-  return callLLMChat(env, chatId, messages, systemPrompt, 16384, 0.9);
+  // Temp 0.8 (was 0.9) — slightly more coherent, still varied
+  return callLLMChat(env, chatId, messages, systemPrompt, 16384, 0.8);
 }

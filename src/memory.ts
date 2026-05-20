@@ -7,8 +7,11 @@ import type { Env, LLMMessage } from "./config";
 import { callLLMLight } from "./ai";
 
 const MAX_EVENTS = 10;
+const SALIENCE_POOL_SIZE = 30;                 // how many recent events to consider
+const SALIENCE_DECAY_DAYS = 14;                // half-life for recency weighting
+const MS_PER_DAY = 86_400_000;
 
-export type EventType = "fight" | "apology" | "personal" | "joke" | "milestone" | "warmth";
+export type EventType = "fight" | "apology" | "personal" | "joke" | "milestone" | "warmth" | "crisis_moment";
 
 export interface EmotionalEvent {
   id: number;
@@ -27,16 +30,18 @@ export async function getEmotionalEvents(
   chatId: number,
   userId: number,
 ): Promise<EmotionalEvent[]> {
+  // D3: Fetch a larger pool, then rank by salience (|valence| × recency weight).
+  // This prevents strong old memories from being crowded out by trivial new ones.
   const rows = await env.DB.prepare(
     `SELECT * FROM emotional_events WHERE chat_id = ? AND user_id = ? ORDER BY ts DESC LIMIT ?`,
   )
-    .bind(chatId, userId, MAX_EVENTS)
+    .bind(chatId, userId, SALIENCE_POOL_SIZE)
     .all<{
       id: number; chat_id: number; user_id: number;
       event_type: string; summary: string; valence: number; ts: number;
     }>();
 
-  return (rows.results || []).map((r) => ({
+  const pool = (rows.results || []).map((r) => ({
     id: r.id,
     chatId: r.chat_id,
     userId: r.user_id,
@@ -45,11 +50,51 @@ export async function getEmotionalEvents(
     valence: r.valence,
     ts: r.ts,
   }));
+
+  if (pool.length <= MAX_EVENTS) return pool;
+
+  // Score: magnitude × exponential decay over days.
+  // salience = |valence| * exp(-ageDays / SALIENCE_DECAY_DAYS)
+  const now = Date.now();
+  const scored = pool.map((e) => {
+    const ageDays = (now - e.ts) / MS_PER_DAY;
+    const salience = Math.abs(e.valence) * Math.exp(-ageDays / SALIENCE_DECAY_DAYS);
+    return { event: e, salience };
+  });
+
+  // Keep top MAX_EVENTS by salience, then re-sort chronologically (newest first) for display
+  scored.sort((a, b) => b.salience - a.salience);
+  const top = scored.slice(0, MAX_EVENTS).map((s) => s.event);
+  top.sort((a, b) => b.ts - a.ts);
+  return top;
 }
 
 // ─── Detect & Save Significant Moments ───────────────────────────────────────
 // Called after sentiment classification on messages with strong sentiment deltas.
 // Uses Flash-Lite to extract a 1-line bookmark of what happened.
+
+// High-signal life-event keywords. Match here bypasses the sentiment-delta gate
+// so we still bookmark "развожусь" / "повысили" / "переехал" when classifier
+// returned neutral (the user is reporting a fact, not directing emotion at Joi).
+const LIFE_EVENT_PATTERNS: { re: RegExp; valenceHint: number }[] = [
+  { re: /\b(?:женил(?:ся|ась)|вышла?\s+замуж|свадьб[а-я]+)\b/i, valenceHint: 0.6 },
+  { re: /\b(?:развел(?:ся|ась)|развод(?:юсь|имся|илсь|илась|или)?|расста(?:ли(?:сь)?|юсь|емся|лся|лась))\b/i, valenceHint: -0.6 },
+  { re: /\b(?:бросил[аи]?\s+меня|кинул[аи]?\s+меня)\b/i, valenceHint: -0.7 },
+  { re: /\b(?:умер(?:л[аи]?)?|скончал(?:ся|ась|ись)|похорон[а-я]+|не\s+стало)\b/i, valenceHint: -0.85 },
+  { re: /\b(?:повысили|повышение|новая\s+работа|устроил(?:ся|ась))\b/i, valenceHint: 0.7 },
+  { re: /\b(?:уволил[аи]?|выгнал[аи]?\s+с\s+работы|потерял[а]?\s+работу)\b/i, valenceHint: -0.7 },
+  { re: /\b(?:переехал[аи]?|переезжаю|переезд)\b/i, valenceHint: 0.3 },
+  { re: /\b(?:поступил[аи]?|сдал[аи]?\s+экзамен|защитил[аи]?\s+диплом)\b/i, valenceHint: 0.6 },
+  { re: /\b(?:роди(?:л|лся|лась|ли)|беременна|жду\s+ребёнка)\b/i, valenceHint: 0.7 },
+  { re: /\b(?:день\s+рождения|др\s+у\s+меня|сегодня\s+мой\s+др)\b/i, valenceHint: 0.5 },
+];
+
+function detectLifeEvent(text: string): { matched: boolean; valenceHint: number } {
+  for (const { re, valenceHint } of LIFE_EVENT_PATTERNS) {
+    if (re.test(text)) return { matched: true, valenceHint };
+  }
+  return { matched: false, valenceHint: 0 };
+}
 
 export async function maybeBookmarkMoment(
   env: Env,
@@ -59,9 +104,12 @@ export async function maybeBookmarkMoment(
   sentiment: "positive" | "negative" | "neutral",
   delta: number,
 ): Promise<void> {
-  // Only bookmark strong emotional moments
+  // Two gates: strong sentiment delta OR life-event keyword match.
+  // The keyword path catches neutral-tone fact reports ("развожусь")
+  // that the sentiment classifier rates as 0.
   const absDelta = Math.abs(delta);
-  if (absDelta < 5) return; // threshold: only significant moments
+  const lifeEvent = detectLifeEvent(text);
+  if (absDelta < 3 && !lifeEvent.matched) return;
 
   const systemPrompt = `Определи тип эмоционального момента и опиши его ОДНОЙ короткой фразой (до 15 слов).
 
@@ -98,9 +146,12 @@ export async function maybeBookmarkMoment(
     const validTypes: EventType[] = ["fight", "apology", "personal", "joke", "milestone", "warmth"];
     if (!validTypes.includes(eventType)) return;
 
-    const valence = sentiment === "positive" ? Math.min(delta / 15, 1.0)
+    let valence = sentiment === "positive" ? Math.min(delta / 15, 1.0)
       : sentiment === "negative" ? Math.max(delta / 15, -1.0)
       : 0;
+    // If sentiment is neutral but a life-event keyword fired, use the keyword's
+    // valence hint so salience ranking gives this memory weight.
+    if (valence === 0 && lifeEvent.matched) valence = lifeEvent.valenceHint;
 
     // Dedup: don't save if a very similar event happened in the last hour
     const recentRows = await env.DB.prepare(
@@ -121,13 +172,15 @@ export async function maybeBookmarkMoment(
       .bind(chatId, userId, eventType, parsed.summary, valence, Date.now())
       .run();
 
-    // Trim to MAX_EVENTS (keep newest)
+    // D3: Keep a larger pool in DB (SALIENCE_POOL_SIZE) so salience ranking at
+    // read time has something to choose from. Trim by recency — at read time
+    // we rank by |valence| × recency to pick the top MAX_EVENTS for display.
     await env.DB.prepare(
       `DELETE FROM emotional_events WHERE chat_id = ? AND user_id = ? AND id NOT IN (
          SELECT id FROM emotional_events WHERE chat_id = ? AND user_id = ? ORDER BY ts DESC LIMIT ?
        )`,
     )
-      .bind(chatId, userId, chatId, userId, MAX_EVENTS)
+      .bind(chatId, userId, chatId, userId, SALIENCE_POOL_SIZE)
       .run();
   } catch (err: any) { 
     console.error(`[Bookmark Parse Failed] raw: "${result}", error: ${err.message}`);
@@ -175,5 +228,6 @@ function eventEmoji(type: EventType): string {
     case "joke": return "😂";
     case "milestone": return "🎯";
     case "warmth": return "💛";
+    case "crisis_moment": return "🔴";
   }
 }

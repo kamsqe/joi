@@ -13,6 +13,7 @@ export interface SaveMessageOptions {
   forwardSource?: string | null;
   replyToMessageId?: number | null;
   threadId?: number | null;
+  quoteText?: string | null;
 }
 
 export async function saveUserMessage(
@@ -24,8 +25,8 @@ export async function saveUserMessage(
   options: SaveMessageOptions = {},
 ): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO messages (chat_id, message_id, user_id, user_name, role, content, is_bot, is_forwarded, forward_source, reply_to_message_id, thread_id, ts)
-     VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages (chat_id, message_id, user_id, user_name, role, content, is_bot, is_forwarded, forward_source, reply_to_message_id, thread_id, quote_text, ts)
+     VALUES (?, ?, ?, ?, 'user', ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
     .bind(
       chatId,
@@ -38,6 +39,7 @@ export async function saveUserMessage(
       options.forwardSource || null,
       options.replyToMessageId || null,
       options.threadId || null,
+      options.quoteText || null,
       Date.now(),
     )
     .run();
@@ -50,12 +52,13 @@ export async function saveBotMessage(
   chatId: number,
   text: string,
   messageId?: number,
+  threadId?: number,
 ): Promise<void> {
   await env.DB.prepare(
-    `INSERT INTO messages (chat_id, message_id, user_id, user_name, role, content, is_bot, is_forwarded, ts)
-     VALUES (?, ?, NULL, 'Джой', 'assistant', ?, 0, 0, ?)`,
+    `INSERT INTO messages (chat_id, message_id, user_id, user_name, role, content, is_bot, is_forwarded, thread_id, ts)
+     VALUES (?, ?, NULL, 'Джой', 'assistant', ?, 0, 0, ?, ?)`,
   )
-    .bind(chatId, messageId || null, text, Date.now())
+    .bind(chatId, messageId || null, text, threadId || null, Date.now())
     .run();
 }
 
@@ -71,8 +74,16 @@ export async function buildContext(
   chatId: number,
   replyToMessageId?: number | null,
   userId?: number | null,
+  replyFallbackText?: string | null,
+  threadId?: number | null,
 ): Promise<LLMMessage[]> {
   const messages: LLMMessage[] = [];
+
+  // D1: For VIP forum topics — filter most layers by thread_id so Joi's context
+  // stays within the current topic. Digests remain global (cross-topic awareness).
+  // Private chats and regular groups pass threadId=null and get unfiltered behavior.
+  const useTopicFilter = !!threadId;
+  const topicFilter = useTopicFilter ? "AND thread_id = ?" : "";
 
   // ── Layer 1: Thread (walk reply chain) ────────────────────────────────────
   const threadMessages: { role: string; user_name: string; content: string; message_id: number; reply_to_message_id: number | null }[] = [];
@@ -99,6 +110,16 @@ export async function buildContext(
     }
   }
 
+  // A4: If thread walker found nothing but we have a fallback text from the
+  // Telegram payload (reply_to_message.text), inject it as a synthetic thread
+  // message so Joi can see what the user was replying to.
+  if (threadMessages.length === 0 && replyFallbackText && replyToMessageId) {
+    messages.push({
+      role: "user",
+      content: `СООБЩЕНИЕ НА КОТОРОЕ ОТВЕЧАЮТ (не найдено в истории):\n${truncate(replyFallbackText, 500)}`,
+    });
+  }
+
   if (threadMessages.length > 0) {
     const threadContent = threadMessages
       .map((m) => {
@@ -114,23 +135,24 @@ export async function buildContext(
   }
 
   // ── Layer 2: Ambient (recent messages, bots tagged, dead articles compressed) ──
-  // Include up to 3 recent forwards alongside 18 organic messages
-  const ambientRows = await env.DB.prepare(
-    `SELECT user_name, content, is_bot, message_id, ts, user_id, reply_to_message_id, is_forwarded, forward_source FROM messages
-     WHERE chat_id = ? AND role = 'user' AND is_forwarded = 0
-     ORDER BY ts DESC LIMIT 18`,
-  )
-    .bind(chatId)
-    .all<{ user_name: string; content: string; is_bot: number; message_id: number; ts: number; user_id: number; reply_to_message_id: number | null; is_forwarded: number; forward_source: string | null }>();
+  // Include up to 3 recent forwards alongside 18 organic messages.
+  // D1: Filter by thread_id for VIP topic scoping.
+  const ambientQuery = `SELECT user_name, content, is_bot, message_id, ts, user_id, reply_to_message_id, is_forwarded, forward_source FROM messages
+     WHERE chat_id = ? AND role = 'user' AND is_forwarded = 0 ${topicFilter}
+     ORDER BY ts DESC LIMIT 18`;
+  const ambientStmt = useTopicFilter
+    ? env.DB.prepare(ambientQuery).bind(chatId, threadId)
+    : env.DB.prepare(ambientQuery).bind(chatId);
+  const ambientRows = await ambientStmt.all<{ user_name: string; content: string; is_bot: number; message_id: number; ts: number; user_id: number; reply_to_message_id: number | null; is_forwarded: number; forward_source: string | null }>();
 
   // Also load recent forwards (capped at 3) so Joi can see shared content
-  const forwardRows = await env.DB.prepare(
-    `SELECT user_name, content, is_bot, message_id, ts, user_id, reply_to_message_id, is_forwarded, forward_source FROM messages
-     WHERE chat_id = ? AND role = 'user' AND is_forwarded = 1
-     ORDER BY ts DESC LIMIT 3`,
-  )
-    .bind(chatId)
-    .all<{ user_name: string; content: string; is_bot: number; message_id: number; ts: number; user_id: number; reply_to_message_id: number | null; is_forwarded: number; forward_source: string | null }>();
+  const forwardQuery = `SELECT user_name, content, is_bot, message_id, ts, user_id, reply_to_message_id, is_forwarded, forward_source FROM messages
+     WHERE chat_id = ? AND role = 'user' AND is_forwarded = 1 ${topicFilter}
+     ORDER BY ts DESC LIMIT 3`;
+  const forwardStmt = useTopicFilter
+    ? env.DB.prepare(forwardQuery).bind(chatId, threadId)
+    : env.DB.prepare(forwardQuery).bind(chatId);
+  const forwardRows = await forwardStmt.all<{ user_name: string; content: string; is_bot: number; message_id: number; ts: number; user_id: number; reply_to_message_id: number | null; is_forwarded: number; forward_source: string | null }>();
 
   // Merge and sort chronologically
   const allAmbient = [
@@ -182,13 +204,13 @@ export async function buildContext(
   // messages are buried in group noise. Only adds if user has messages not
   // already in ambient.
   if (userId) {
-    const focusRows = await env.DB.prepare(
-      `SELECT content FROM messages
-       WHERE chat_id = ? AND user_id = ? AND role = 'user' AND is_bot = 0 AND is_forwarded = 0
-       ORDER BY ts DESC LIMIT 5`,
-    )
-      .bind(chatId, userId)
-      .all<{ content: string }>();
+    const focusQuery = `SELECT content FROM messages
+       WHERE chat_id = ? AND user_id = ? AND role = 'user' AND is_bot = 0 AND is_forwarded = 0 ${topicFilter}
+       ORDER BY ts DESC LIMIT 5`;
+    const focusStmt = useTopicFilter
+      ? env.DB.prepare(focusQuery).bind(chatId, userId, threadId)
+      : env.DB.prepare(focusQuery).bind(chatId, userId);
+    const focusRows = await focusStmt.all<{ content: string }>();
 
     if (focusRows.results && focusRows.results.length > 2) {
       // Only add if user has more than 2 recent messages (otherwise ambient covers it)
@@ -205,13 +227,14 @@ export async function buildContext(
   }
 
   // ── Layer 3: Self-awareness (last 5 bot messages) ─────────────────────────
-  const selfRows = await env.DB.prepare(
-    `SELECT content FROM messages
-     WHERE chat_id = ? AND role = 'assistant'
-     ORDER BY ts DESC LIMIT 5`,
-  )
-    .bind(chatId)
-    .all<{ content: string }>();
+  // D1: Filter by topic so dedup is topic-scoped (bot can reuse themes across topics)
+  const selfQuery = `SELECT content FROM messages
+     WHERE chat_id = ? AND role = 'assistant' ${topicFilter}
+     ORDER BY ts DESC LIMIT 5`;
+  const selfStmt = useTopicFilter
+    ? env.DB.prepare(selfQuery).bind(chatId, threadId)
+    : env.DB.prepare(selfQuery).bind(chatId);
+  const selfRows = await selfStmt.all<{ content: string }>();
 
   if (selfRows.results && selfRows.results.length > 0) {
     const selfContent = selfRows.results
@@ -226,13 +249,14 @@ export async function buildContext(
   }
 
   // ── Layer 4: Forwarded content awareness ──────────────────────────────────
-  const forwardedRows = await env.DB.prepare(
-    `SELECT user_name, forward_source, content FROM messages
-     WHERE chat_id = ? AND is_forwarded = 1
-     ORDER BY ts DESC LIMIT 10`,
-  )
-    .bind(chatId)
-    .all<{ user_name: string; forward_source: string | null; content: string }>();
+  // D1: Filter by topic so forwarded articles from other topics don't bleed in
+  const forwardedQuery = `SELECT user_name, forward_source, content FROM messages
+     WHERE chat_id = ? AND is_forwarded = 1 ${topicFilter}
+     ORDER BY ts DESC LIMIT 10`;
+  const forwardedStmt = useTopicFilter
+    ? env.DB.prepare(forwardedQuery).bind(chatId, threadId)
+    : env.DB.prepare(forwardedQuery).bind(chatId);
+  const forwardedRows = await forwardedStmt.all<{ user_name: string; forward_source: string | null; content: string }>();
 
   if (forwardedRows.results && forwardedRows.results.length > 0) {
     const forwardedContent = forwardedRows.results
@@ -453,12 +477,18 @@ export async function isAmonyaActive(env: Env, chatId: number, limit: number = 1
 
 // ─── Get Recent Bot Messages (for proactive dedup) ──────────────────────────
 
-export async function getRecentBotMessages(env: Env, chatId: number, limit: number = 3): Promise<string[]> {
-  const rows = await env.DB.prepare(
-    `SELECT content FROM messages WHERE chat_id = ? AND role = 'assistant' ORDER BY ts DESC LIMIT ?`,
-  )
-    .bind(chatId, limit)
-    .all<{ content: string }>();
+export async function getRecentBotMessages(env: Env, chatId: number, limit: number = 8, threadId?: number): Promise<string[]> {
+  // When threadId is provided (VIP topic), only dedup within that topic so Joi
+  // can reuse themes across different topics without sounding repetitive.
+  const query = threadId
+    ? `SELECT content FROM messages WHERE chat_id = ? AND role = 'assistant' AND thread_id = ? ORDER BY ts DESC LIMIT ?`
+    : `SELECT content FROM messages WHERE chat_id = ? AND role = 'assistant' ORDER BY ts DESC LIMIT ?`;
+
+  const stmt = threadId
+    ? env.DB.prepare(query).bind(chatId, threadId, limit)
+    : env.DB.prepare(query).bind(chatId, limit);
+
+  const rows = await stmt.all<{ content: string }>();
 
   return (rows.results || []).map((r) => r.content.slice(0, 100));
 }

@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS messages (
   forward_source TEXT,
   reply_to_message_id INTEGER,
   thread_id INTEGER,
+  quote_text TEXT,
   ts INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, ts DESC);

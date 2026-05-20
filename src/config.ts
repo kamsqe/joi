@@ -14,6 +14,7 @@ export interface Env {
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  edited_message?: TelegramMessage;
 }
 
 export interface TelegramMessage {
@@ -32,6 +33,7 @@ export interface TelegramMessage {
   document?: { file_id: string; file_name?: string };
   animation?: { file_id: string };
   reply_to_message?: TelegramMessage;
+  quote?: { text: string; position?: number; is_manual?: boolean };
   forward_from_chat?: { title?: string; type?: string };
   forward_sender_name?: string;
   forward_from?: TelegramUser;

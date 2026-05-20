@@ -192,6 +192,7 @@ export function parseUpdate(body: unknown): TelegramUpdate | null {
   if (!body || typeof body !== "object") return null;
   const update = body as TelegramUpdate;
   if (!update.update_id) return null;
+  // edited_message comes as a separate field — preserve it for the handler
   return update;
 }
 
@@ -259,15 +260,68 @@ export function splitMessage(text: string): string[] {
 
 // ─── Sanitize LLM Response ──────────────────────────────────────────────────
 
+// Thinking-trigger phrases that almost never appear in a real Russian reply.
+// Matched at start-of-line — strips from that line to end of response.
+const THINKING_TRIGGERS = [
+  "Wait,", "Wait.", "Wait ", "Wait —", "Wait-",
+  "Okay,", "Okay.", "Okay so", "Okay, so",
+  "Looking ", "Let me ", "Let's ", "I'll ", "I need ", "I should ", "I see ",
+  "Actually,", "Actually ",
+  "Hmm,", "Hmm.", "Hmm ",
+  "Note:", "Note ",
+  "Searching ", "Thinking ", "Re-reading", "Reading the",
+  "The user ", "The prompt ", "The system ",
+  "Ah, ", "Ah,", "Ah I", "Ah—",
+];
+
 export function sanitizeResponse(text: string): string {
   let result = text;
+  const original = text;
 
-  // Strip thinking artifacts that leak into response
-  // Pattern 1: "*Wait, ...", "*Thinking...", "*Let me...", etc.
-  result = result.replace(/\s*\*(?:Wait|Thinking|Let me|I need|I should|Hmm|Ok |The prompt|The user|Ask |Suggest|Note)[^]*$/i, "");
-  // Pattern 2: Internal formatting like "Music/Food):* Ask about..."
-  result = result.replace(/\s*[\w\/\)]+\):\*\s*[^]*$/i, "");
-  // Pattern 3: Entire response is thinking artifact (no Cyrillic at all)
+  // Pattern A: strip from line beginning at a thinking trigger to end-of-string
+  const triggerAlt = THINKING_TRIGGERS
+    .map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  result = result.replace(new RegExp(`(?:^|\\n)\\s*(?:${triggerAlt})[\\s\\S]*$`, "i"), "");
+
+  // Pattern B: asterisk-bracketed thoughts like *Searching for "..."*
+  result = result.replace(/\s*\*(?:Searching|Wait|Thinking|Let me|I need|I should|Hmm|Ok |The prompt|The user|Note|Looking|Reading)[\s\S]*$/i, "");
+
+  // Pattern C: enumerated self-instruction planning lists ("\n- Don't...", "\n- Be flirty...")
+  result = result.replace(/\n\s*-\s+(?:Don't|Do not|Be |Use |Maybe |Make |Keep |Avoid |Reply )[\s\S]*$/i, "");
+
+  // Pattern D: internal formatting like "Music/Food):* Ask about..."
+  result = result.replace(/\s*[\w\/\)]+\):\*\s*[\s\S]*$/i, "");
+
+  // Latin-ratio guard: if what's left has too much Latin for a Russian persona,
+  // the strip didn't catch the leak. Drop entirely rather than ship it.
+  if (result.length > 60) {
+    const latin = (result.match(/[A-Za-z]/g) || []).length;
+    const cyrillic = (result.match(/[А-Яа-яЁё]/g) || []).length;
+    const totalLetters = latin + cyrillic;
+    if (totalLetters > 0 && latin / totalLetters > 0.45) {
+      console.log(JSON.stringify({
+        event: "sanitize_drop_latin",
+        latinPct: Math.round((latin / totalLetters) * 100),
+        len: result.length,
+        sample: original.slice(0, 200),
+      }));
+      result = "";
+    }
+  }
+
+  // Length sanity: a real Joi response is rarely > 1500 chars. If it's huge AND
+  // contains a known thinking marker, kill it.
+  if (result.length > 1500 && /(?:Wait,|Okay,|I need|Let me|Looking at|Searching)/i.test(result)) {
+    console.log(JSON.stringify({
+      event: "sanitize_drop_oversize",
+      len: result.length,
+      sample: original.slice(0, 200),
+    }));
+    result = "";
+  }
+
+  // No Cyrillic at all → not a Russian reply → drop
   if (result.length > 0 && !/[а-яёА-ЯЁ]/.test(result)) {
     result = "";
   }
