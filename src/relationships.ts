@@ -218,9 +218,12 @@ export function getRelationshipTier(score: number): RelationshipTier {
 
 // ─── Build Relationship Summary for System Prompt ────────────────────────────
 
-export function buildRelationshipSummary(profile: UserProfile): string {
+export function buildRelationshipSummary(profile: UserProfile, displayName?: string): string {
   const tier = getRelationshipTier(profile.score);
-  const name = profile.nickname || "Незнакомец";
+  // Prefer the explicit displayName the caller resolved (handles peer bots
+  // like Amonya, who have no profile.nickname but a known fixed identity).
+  // Falls back to profile.nickname, then "Незнакомец".
+  const name = displayName || profile.nickname || "Незнакомец";
 
   const tierDescriptions: Record<RelationshipTier, string> = {
     bestie:   "Это твой лучший друг, ты его обожаешь. Будь тёплой, милой, можно пофлиртовать.",

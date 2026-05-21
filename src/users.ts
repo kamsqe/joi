@@ -2,7 +2,7 @@
 // Dynamic, D1-backed. VIP group members have pre-loaded defaults.
 
 import type { Env } from "./config";
-import { VIP_GROUP_ID, VIP_MEMBERS } from "./config";
+import { VIP_GROUP_ID, VIP_MEMBERS, AMONYA_BOT_ID } from "./config";
 import { getProfile } from "./relationships";
 
 // ─── Resolve Display Name ────────────────────────────────────────────────────
@@ -14,6 +14,13 @@ export async function resolveUserName(
   userId: number,
   telegramFirstName?: string,
 ): Promise<string> {
+  // 0. Peer bot — Amonya has a fixed identity. Hard-pin so he can't be
+  //    overridden by Telegram first_name changes or accidentally fall through
+  //    to "Незнакомец". Critical: without this, the system prompt says
+  //    "Тебе пишет Незнакомец" while the message tag says [Амоня], and the
+  //    LLM resolves the mismatch by picking a familiar VIP name (Rus).
+  if (userId === AMONYA_BOT_ID) return "Амоня";
+
   const profile = await getProfile(env, chatId, userId);
 
   // 1. User-set nickname override (highest priority)

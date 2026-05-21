@@ -501,6 +501,10 @@ export function buildSystemPrompt(
   }
 
   // ── DYNAMIC SUFFIX (changes per request — must come after stable prefix) ──
+  // Speaker pin: the LLM was drifting to a familiar VIP name (Rus) when the
+  // sender wasn't in VIP_MEMBERS. Anchoring the current speaker explicitly
+  // before any other dynamic content fixes that.
+  prompt += `\n\nСЕЙЧАС ТЕБЕ ПИШЕТ: ${userName}. Все обращения в ответе должны быть к ${userName}, не к другим участникам чата.`;
   prompt += "\n\n" + timeOfDayBlock();
 
   // S1+S3: Social graph (VIP only) — who's close, who's clashing
@@ -522,8 +526,9 @@ export function buildSystemPrompt(
 
   prompt += "\n\n" + moodBlock(effectiveMood, options?.currentUserId, profile);
 
-  // Relationship
-  const relationshipInfo = buildRelationshipSummary(profile);
+  // Relationship — pass the resolved userName so peer-bot / non-VIP senders
+  // don't show as "Незнакомец" while their message tag says [Name].
+  const relationshipInfo = buildRelationshipSummary(profile, userName);
   prompt += "\n\n" + relationshipInfo;
 
   // Newcomer softness — only for genuinely new users (first seen < 7 days AND low score)
@@ -627,8 +632,9 @@ export function buildProactiveSystemPrompt(
   prompt += "\n\n" + timeOfDayBlock();
   prompt += "\n\n" + moodBlock(mood, undefined, profile);
 
-  // Relationship
-  const relationshipInfo = buildRelationshipSummary(profile);
+  // Relationship — pass the resolved userName so peer-bot / non-VIP senders
+  // don't show as "Незнакомец" while their message tag says [Name].
+  const relationshipInfo = buildRelationshipSummary(profile, userName);
   prompt += "\n\n" + relationshipInfo;
 
   // Facts
