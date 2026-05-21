@@ -629,18 +629,21 @@ async function handleActiveMessage(
   const startChat = Date.now();
   // Load social intelligence + chat mood for VIP only (cost-gated — extra SQL).
   const isVip = chatId === VIP_GROUP_ID;
-  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood] = await Promise.all([
+  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood, recentBotMessages] = await Promise.all([
     getFacts(env, chatId, userId),
     getEmotionalEvents(env, chatId, userId),
     hasRecentCrisis(env, chatId, userId),
     isVip ? buildSocialGraph(env, chatId, 7) : Promise.resolve([]),
     isVip ? computeChatMood(env, chatId, 48) : Promise.resolve(null),
+    // Last 30 bot outputs power the anti-repetition guard (opener n-grams,
+    // canon hobby mute, self-ref tic suppression).
+    (await import("./context")).getRecentBotMessages(env, chatId, 30, threadId),
   ]);
   // Compute days since last message for rare speaker detection
   const daysSinceLastMessage = profile.lastInteraction
     ? Math.floor((Date.now() - profile.lastInteraction) / 86_400_000)
     : undefined;
-  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage, crisis, recentCrisis, socialGraph, chatMood });
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage, crisis, recentCrisis, socialGraph, chatMood, currentMessage: text, recentBotMessages });
 
   // Send "typing" indicator before LLM call
   await sendChatAction(env, chatId, "typing", threadId);

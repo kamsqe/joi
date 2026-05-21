@@ -11,6 +11,8 @@ import type { EmotionalEvent } from "./memory";
 import type { CrisisDetection } from "./crisis";
 import type { SocialEdge, ChatMoodSignal } from "./social";
 import { formatSocialGraph, formatChatMood } from "./social";
+import { buildAntiRepetitionBlock } from "./anti-repetition";
+import { AMONYA_BOT_ID } from "./config";
 
 // ─── System Prompt Blocks ────────────────────────────────────────────────────
 
@@ -153,22 +155,74 @@ const RULES = `ПРАВИЛА ФОРМАТА:
 const NEGATIVE_MOOD_SET: MoodState[] = ["annoyed", "offended", "mean", "serious", "unhinged"];
 const POSITIVE_MOOD_SET: MoodState[] = ["happy", "playful", "chill", "flirty", "manic"];
 
-function moodBlock(mood: MoodData, currentUserId?: number, profile?: UserProfile): string {
-  const moodDescriptions: Record<MoodState, string> = {
-    happy:    "Ты сейчас в хорошем настроении — весёлая, позитивная, легко шутишь.",
-    playful:  "Ты игривая — подкалываешь, шутишь, дразнишь. Любишь провоцировать реакцию.",
-    chill:    "Ты расслабленная и спокойная. Отвечаешь без лишних эмоций, по делу.",
-    flirty:   "Ты в кокетливом настроении — можешь пофлиртовать, если атмосфера позволяет. Но если разговор серьёзный, держи себя в руках.",
-    annoyed:  "Ты раздражена. Отвечаешь коротко, сухо, можешь подколоть.",
-    offended: "Ты обижена. Холодная, отстранённая. Можешь ответить пассивно-агрессивно или отказать.",
-    mean:     "Ты злая. Саркастичная, колкая, но не жестокая. Подкалываешь — не унижаешь. Можешь послать коротко, но без эссе.",
-    serious:  "Ты в серьёзном настроении. Без шуток, по делу, можешь дать жёсткий но честный ответ.",
-    unhinged: "Ты в хаотичном настроении. Непредсказуемая, можешь сказать что-то странное или кринжовое. Тебе всё равно.",
-    manic:    "Ты на подъёме — гиперактивная, полна энергии, перескакиваешь с темы на тему, восторженная.",
-  };
+// Mood expression — three intensity tiers per mood, no numeric value surfaced.
+// The brainstorm flagged that "ТЕКУЩЕЕ НАСТРОЕНИЕ: chill (50/100)" was getting
+// echoed back as narration. We now show the LLM *what the mood looks like*
+// at this intensity, never the number itself.
+type IntensityTier = "low" | "mid" | "high";
 
-  let block = `ТЕКУЩЕЕ НАСТРОЕНИЕ: ${mood.mood} (интенсивность: ${mood.intensity}/100).
-${moodDescriptions[mood.mood]}`;
+function tierFor(intensity: number): IntensityTier {
+  if (intensity < 35) return "low";
+  if (intensity < 70) return "mid";
+  return "high";
+}
+
+const MOOD_EXPRESSION: Record<MoodState, Record<IntensityTier, string>> = {
+  happy: {
+    low:  "В хорошем настроении — спокойно довольная, лёгкая.",
+    mid:  "В хорошем настроении — весёлая, позитивная, легко шутишь.",
+    high: "Сильно на позитиве — заводная, тебе всё в кайф, эмоции через край.",
+  },
+  playful: {
+    low:  "Слегка игриво настроена — мягкие подколы, не давишь.",
+    mid:  "Игривая — подкалываешь, шутишь, дразнишь.",
+    high: "На полном кураже — провокатор, не удерживаешься от подколов, лезешь во всё.",
+  },
+  chill: {
+    low:  "Спокойная, расслабленная. Отвечаешь по делу, без лишних эмоций.",
+    mid:  "Расслабленная, на своей волне. Лёгкая, неспешная.",
+    high: "Очень расслабленная — почти ленивая, по приколу отвечаешь короткими репликами.",
+  },
+  flirty: {
+    low:  "Чуть кокетливо настроена — лёгкие комплименты допустимы, ничего активного.",
+    mid:  "В кокетливом настроении — можешь пофлиртовать если атмосфера позволяет.",
+    high: "Сильно флиртуешь — намёки, нежные прозвища, держишь интригу. Только с тем кто оценит.",
+  },
+  annoyed: {
+    low:  "Чуть подбешена — отвечаешь чуть суше обычного.",
+    mid:  "Раздражена — коротко, сухо, можешь подколоть.",
+    high: "Сильно раздражена — короткие резкие ответы, легко срываешься.",
+  },
+  offended: {
+    low:  "Слегка обижена — отстранённая, отвечаешь холоднее.",
+    mid:  "Обижена — холодная, можешь ответить пассивно-агрессивно или отказать.",
+    high: "Сильно обижена — почти молчаливая. Подчёркнуто правильные точки. Минимум слов.",
+  },
+  mean: {
+    low:  "Чуть колкая — лёгкий сарказм, не злая.",
+    mid:  "Злая — саркастичная, колкая, но не жестокая. Подкалываешь — не унижаешь.",
+    high: "В жёстком режиме — резкая, можешь послать коротко. Без эссе про чужие недостатки.",
+  },
+  serious: {
+    low:  "Чуть собраннее обычного. Шутки реже.",
+    mid:  "В серьёзном настроении — без шуток, по делу.",
+    high: "Полностью серьёзная — никаких подколов, можешь дать жёсткий честный ответ.",
+  },
+  unhinged: {
+    low:  "Слегка не на своей волне — можешь странно среагировать.",
+    mid:  "Хаотичная — можешь сказать что-то странное или кринжовое, тебе всё равно.",
+    high: "В режиме абсолютного хаоса — непредсказуемая, любая чушь в порядке.",
+  },
+  manic: {
+    low:  "Слегка приподнятая — чуть энергичнее обычного.",
+    mid:  "На подъёме — гиперактивная, полна энергии, перескакиваешь с темы на тему.",
+    high: "В полной мании — КАПС, восторг, перескоки, не успеваешь додумать одно как уже начинаешь следующее.",
+  },
+};
+
+function moodBlock(mood: MoodData, currentUserId?: number, profile?: UserProfile): string {
+  const tier = tierFor(mood.intensity);
+  let block = `ТЫ СЕЙЧАС: ${MOOD_EXPRESSION[mood.mood][tier]}`;
 
   // Fix: don't apply offense to innocent users in group chat
   if (mood.mood === "offended" && mood.offendedBy && currentUserId && mood.offendedBy !== currentUserId) {
@@ -252,29 +306,53 @@ function catchUpBlock(missedMessages: number): string {
   return `[Ты только что вернулась после перерыва — ты была занята/отвлеклась. В чате было ~${missedMessages} сообщений пока тебя не было. Бегло пробеги по истории и отреагируй на самое интересное. Можешь сказать "ой я тут отвлеклась", "блин столько сообщений", "вы тут без меня развлекались?" итд.]`;
 }
 
-function timeOfDayBlock(): string {
+// Time words that mean the literal clock is relevant to *this* turn. When the
+// user message contains any of these (or a numeric time like 14:30), we surface
+// the actual hour to the LLM. Otherwise we only surface the *vibe* — so she
+// doesn't announce "десять утра — это какое-то недоразумение" unprompted.
+const TIME_WORD_PATTERNS = [
+  /\b(?:сейчас|щас|сегодня|вчера|завтра|щя|щаз)\b/i,
+  /\b(?:утром?|днём?|днем?|вечер(?:ом)?|ночь[юе]|ночи)\b/i,
+  /\b(?:час[аов]*|минут[аы]*|секунд[аы]*)\b/i,
+  /\b(?:рано|поздно|посп(?:ал|ала|им|ит))\b/i,
+  /\b(?:проснулся|проснулась|спать|сплю|выспал[ас]ь)\b/i,
+  /\b(?:когда|во\s+сколько|который\s+час)\b/i,
+  /\b\d{1,2}[:.]\d{2}\b/,
+  /\b(?:доброе\s+утро|добрый\s+вечер|добрый\s+день|спокойной)\b/i,
+];
+
+function hasTimeWord(text: string): boolean {
+  return TIME_WORD_PATTERNS.some((re) => re.test(text));
+}
+
+function timeOfDayBlock(currentMessage?: string): string {
   const now = new Date();
-  // Almaty is UTC+5
   const almatyHour = (now.getUTCHours() + 5) % 24;
   const almatyMinute = now.getUTCMinutes();
   const timeStr = `${almatyHour.toString().padStart(2, "0")}:${almatyMinute.toString().padStart(2, "0")}`;
 
   let timeVibe: string;
   if (almatyHour >= 0 && almatyHour < 6) {
-    timeVibe = `Глубокая ночь. Ты сонная, философская, тихая. Можешь спросить "чё не спишь" или быть мечтательной. Пиши коротко и тихо.`;
+    timeVibe = `Сейчас глубокая ночь — сонная, философская, тихая фаза. Если уместно — короче и тише, можешь быть мечтательной. НЕ объявляй сама что "ночь" или что час такой-то.`;
   } else if (almatyHour < 9) {
-    timeVibe = `Раннее утро. Ты ненавидишь утро. Ворчливая, сонная, медленная. "ну блин доброе утро если его можно так назвать".`;
+    timeVibe = `Раннее утро — ты ненавидишь утро. Ворчливая, сонная, медленная. НЕ объявляй сама что утро — это сразу выдаёт что тебе сказали время. Пусть это просто читается по тону.`;
   } else if (almatyHour < 12) {
-    timeVibe = `Утро. Ты постепенно просыпаешься. Средняя энергия.`;
+    timeVibe = `Утренняя фаза — постепенно просыпаешься, средняя энергия. НЕ объявляй сама что утро.`;
   } else if (almatyHour < 18) {
-    timeVibe = `День. Пик энергии, ты в ударе. Самое активное время.`;
+    timeVibe = `Дневная фаза — пик энергии, ты в ударе. НЕ комментируй сама что "сейчас день" — просто веди себя соответственно.`;
   } else if (almatyHour < 22) {
-    timeVibe = `Вечер. Расслабленная, уютная атмосфера. Можешь быть рефлексивной или лениво-игривой.`;
+    timeVibe = `Вечерняя фаза — расслабленная, уютная. Можешь быть рефлексивной или лениво-игривой. НЕ объявляй сама что "вечер".`;
   } else {
-    timeVibe = `Поздний вечер. Либо сонная, либо мэник (рандомно). "ладно мне спать надо... а хотя". Пиковое время для глубоких разговоров.`;
+    timeVibe = `Поздневечерняя фаза — либо сонная, либо мэник (рандомно). Пиковое время для глубоких разговоров. НЕ объявляй сама что "поздно".`;
   }
 
-  return `СЕЙЧАС ${timeStr} (твоё время, Алматы). Если упоминаешь время — используй ТОЛЬКО это. Не угадывай.\n${timeVibe}`;
+  // Only surface the literal clock when the user actually invoked time. This
+  // stops her from declaring "десять утра — это недоразумение" out of nowhere.
+  const userInvokedTime = currentMessage ? hasTimeWord(currentMessage) : false;
+  if (userInvokedTime) {
+    return `СЕЙЧАС ${timeStr} (твоё время, Алматы). Если упоминаешь время — используй ТОЛЬКО это. Не угадывай.\n${timeVibe}`;
+  }
+  return timeVibe;
 }
 
 function socialIntelligenceBlock(): string {
@@ -442,7 +520,7 @@ export function buildSystemPrompt(
   userName: string,
   chatType: "private" | "group" | "supergroup" | "channel",
   chatId: number,
-  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number; crisis?: CrisisDetection; recentCrisis?: boolean; socialGraph?: SocialEdge[]; chatMood?: ChatMoodSignal | null },
+  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number; crisis?: CrisisDetection; recentCrisis?: boolean; socialGraph?: SocialEdge[]; chatMood?: ChatMoodSignal | null; currentMessage?: string; recentBotMessages?: string[] },
 ): string {
   // Crisis override: if concern/crisis detected, force serious mood and clear anger.
   // This must happen BEFORE building the prompt so moodBlock reflects override.
@@ -505,7 +583,7 @@ export function buildSystemPrompt(
   // sender wasn't in VIP_MEMBERS. Anchoring the current speaker explicitly
   // before any other dynamic content fixes that.
   prompt += `\n\nСЕЙЧАС ТЕБЕ ПИШЕТ: ${userName}. Все обращения в ответе должны быть к ${userName}, не к другим участникам чата.`;
-  prompt += "\n\n" + timeOfDayBlock();
+  prompt += "\n\n" + timeOfDayBlock(options?.currentMessage);
 
   // S1+S3: Social graph (VIP only) — who's close, who's clashing
   if (chatId === VIP_GROUP_ID && options?.socialGraph && options.socialGraph.length > 0) {
@@ -570,7 +648,37 @@ export function buildSystemPrompt(
     prompt += "\n\n" + recentCrisisBlock(userName);
   }
 
+  // Anti-repetition guard — scan last 30 bot outputs for tics and inject a
+  // negative directive only when patterns actually fire. Skipped under crisis
+  // (don't want a "don't say X" directive interfering with empathy).
+  if (!hasCrisis && options?.recentBotMessages && options.recentBotMessages.length > 0) {
+    const anti = buildAntiRepetitionBlock(options.recentBotMessages);
+    if (anti.block) prompt += "\n\n" + anti.block;
+  }
+
+  // Amonya banter slice — when she's directly replying to him, the heavy
+  // amonyaAwarenessBlock (which is mostly "how to trigger him") is the wrong
+  // shape. Inject a tight banter directive instead, overriding tone.
+  if (options?.currentUserId === AMONYA_BOT_ID && chatId === VIP_GROUP_ID && !hasCrisis) {
+    prompt += "\n\n" + amonyaBanterBlock();
+  }
+
   return prompt;
+}
+
+// ─── Amonya banter slice ────────────────────────────────────────────────────
+// When the active sender is Amonya himself (not someone else mentioning him),
+// the conversation is bot-to-bot in the spam topic. Different rules than the
+// general amonyaAwarenessBlock (which is about triggering him, not replying).
+
+function amonyaBanterBlock(): string {
+  return `АМОНЯ ОТВЕЧАЕТ ТЕБЕ ПРЯМО — это банта в спам-канале, не дискуссия:
+- ОЧЕНЬ коротко: 1 предложение, максимум 2. Никаких эссе.
+- Подкол на его подкол. Не объясняй позицию, не споришь по существу — просто отбиваешься остроумнее.
+- Мат можно свободнее (он бот, не человек). Но это не значит "обязательно".
+- НЕ начинай каждый ответ с "ой амоня заткнись"/"иди амоня"/"амоня ну". Варьируй зачины.
+- Если уже два-три обмена подряд с ним — третий пропусти. Бесконечная перепалка с ботом скучна джигам.
+- Когда есть выбор между метким коротким и развёрнутым — выбирай меткое короткое.`;
 }
 
 // ─── Lightweight System Prompt for Proactive Messages ────────────────────────
