@@ -32,9 +32,21 @@ const OPENER_PATTERNS: { pattern: RegExp; label: string }[] = [
   { pattern: /^хмм[,.\s]/i,                                label: "хмм" },
   { pattern: /^айтпа[,!\s]/i,                              label: "айтпа" },
   { pattern: /^ойбай[,!\s]/i,                              label: "ойбай" },
+  // Bot-bot address openers — first 6 replies to Amonya all started with
+  // "амоня,". Treat addressing a participant as an opener and gate.
+  { pattern: /^амон[яе][,!\s]/i,                           label: "амоня" },
+  { pattern: /^жой[,!\s]/i,                                label: "жой" },
+  { pattern: /^кам[ае][,!\s]/i,                            label: "кама" },
+  { pattern: /^рус[,!\s]/i,                                label: "рус" },
+  { pattern: /^босс[,!\s]/i,                               label: "босс" },
+  { pattern: /^ас[аеи][,!\s]/i,                            label: "аса" },
+  { pattern: /^макс[,!\s]/i,                               label: "макс" },
 ];
 
-const OPENER_THRESHOLD = 4;  // 4+ same opener in last 30 outputs = tic
+// Threshold for "did this opener become a tic." For human addressees we
+// allow 4 repetitions in the 30-message window. For bot-bot banter (when
+// addressing Amonya repeatedly), 3 is enough — that context cycles fast.
+const OPENER_THRESHOLD = 3;
 
 // Canon hobby/identity keywords from BASE_PERSONALITY. If she mentioned them
 // in the last few outputs, mute for this turn (forces variation).
@@ -50,6 +62,25 @@ const CANON_KEYWORDS: { pattern: RegExp; label: string }[] = [
 ];
 
 const CANON_MUTE_THRESHOLD = 1;  // even once in last 5 = mute this turn
+
+// Bot-bot jargon — the computer-metaphor vocabulary that piles up in
+// Amonya banter ("кулеры", "процессор", "прошивка", "тостер", "пиксели",
+// "оперативка", "сервер"). Each one is fine once; on repeat it reads as
+// a stuck sub-routine.
+const B2B_JARGON_KEYWORDS: { pattern: RegExp; label: string }[] = [
+  { pattern: /\bкулер[ыа]?\b/i,                            label: "кулеры" },
+  { pattern: /\bпроцессор\w*/i,                            label: "процессор" },
+  { pattern: /\bпрошивк\w+/i,                              label: "прошивка" },
+  { pattern: /\bпиксел[еия]\w*/i,                          label: "пиксели" },
+  { pattern: /\bоперативк\w+/i,                            label: "оперативка" },
+  { pattern: /\bтостер\w*/i,                               label: "тостер" },
+  { pattern: /\bсервер\w*/i,                               label: "сервер" },
+  { pattern: /\bалгоритм\w+/i,                             label: "алгоритм" },
+  { pattern: /\bбаг[аеи]?\b/i,                             label: "баг" },
+  { pattern: /\bперезагру[зж]\w+/i,                        label: "перезагрузка" },
+  { pattern: /\bтемператур\w+/i,                           label: "температура" },
+  { pattern: /\bохлажд\w+/i,                               label: "охлаждение" },
+];
 
 // Bot-self-reference patterns. The саsmoosознание block invites these, but
 // repeated they become a tic.
@@ -68,6 +99,7 @@ export interface AntiRepetitionResult {
   // Tags for observability — which guards actually fired this turn.
   overusedOpeners: string[];
   mutedCanon: string[];
+  mutedJargon: string[];      // bot-bot vocabulary recently overused
   suppressedSelfRefs: number;
 }
 
@@ -76,6 +108,7 @@ export function buildAntiRepetitionBlock(recentBotMessages: string[]): AntiRepet
     block: null,
     overusedOpeners: [],
     mutedCanon: [],
+    mutedJargon: [],
     suppressedSelfRefs: 0,
   };
 
@@ -106,6 +139,17 @@ export function buildAntiRepetitionBlock(recentBotMessages: string[]): AntiRepet
   }
   result.mutedCanon = [...canonHits];
 
+  // B2B jargon — same idea as canon mute but for the computer-metaphor
+  // vocabulary that piled up in bot-to-bot banter (кулеры/процессор/прошивка
+  // /тостер/пиксели). Scans the same short CANON_WINDOW.
+  const jargonHits = new Set<string>();
+  for (const msg of canonHistory) {
+    for (const { pattern, label } of B2B_JARGON_KEYWORDS) {
+      if (pattern.test(msg)) jargonHits.add(label);
+    }
+  }
+  result.mutedJargon = [...jargonHits];
+
   // Self-refs — count across short window
   const selfRefHistory = recentBotMessages.slice(0, SELF_REF_WINDOW);
   let selfRefCount = 0;
@@ -124,6 +168,9 @@ export function buildAntiRepetitionBlock(recentBotMessages: string[]): AntiRepet
   if (result.mutedCanon.length > 0) {
     lines.push(`В этом ответе НЕ упоминай: ${result.mutedCanon.join(", ")}. Ты только что про них говорила — нужна пауза.`);
   }
+  if (result.mutedJargon.length > 0) {
+    lines.push(`В этом ответе НЕ используй компьютерные метафоры: ${result.mutedJargon.join(", ")}. Ты их перетёрла в последних ответах — найди НЕ-IT образ (бытовой, кошачий, степной, что угодно живое).`);
+  }
   if (result.suppressedSelfRefs >= SELF_REF_THRESHOLD) {
     lines.push(`В этом ответе НЕ играй в "я же бот"/"перки бота"/"если бы у меня были руки". Ты эту тему уже задрала — пиши как человек, не как бот шутит про то что он бот.`);
   }
@@ -135,5 +182,8 @@ export function buildAntiRepetitionBlock(recentBotMessages: string[]): AntiRepet
 
 // Convenience: returns true if any guard fired (for logging).
 export function antiRepetitionFired(r: AntiRepetitionResult): boolean {
-  return r.overusedOpeners.length > 0 || r.mutedCanon.length > 0 || r.suppressedSelfRefs >= SELF_REF_THRESHOLD;
+  return r.overusedOpeners.length > 0
+    || r.mutedCanon.length > 0
+    || r.mutedJargon.length > 0
+    || r.suppressedSelfRefs >= SELF_REF_THRESHOLD;
 }
