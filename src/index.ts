@@ -19,6 +19,7 @@ import { getFacts, extractAndSaveFacts, getRecentActiveFacts, saveBatchFacts } f
 import { maybeBookmarkMoment, getEmotionalEvents } from "./memory";
 import { buildSocialGraph, computeChatMood } from "./social";
 import { shouldGenerateDigest, generateAndStoreDigest, pruneOldDigests } from "./digests";
+import { getCurrentInterest, rotateInterestIfNeeded } from "./interests";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
 
@@ -629,7 +630,7 @@ async function handleActiveMessage(
   const startChat = Date.now();
   // Load social intelligence + chat mood for VIP only (cost-gated — extra SQL).
   const isVip = chatId === VIP_GROUP_ID;
-  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood, recentBotMessages] = await Promise.all([
+  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood, recentBotMessages, currentInterest] = await Promise.all([
     getFacts(env, chatId, userId),
     getEmotionalEvents(env, chatId, userId),
     hasRecentCrisis(env, chatId, userId),
@@ -638,12 +639,14 @@ async function handleActiveMessage(
     // Last 30 bot outputs power the anti-repetition guard (opener n-grams,
     // canon hobby mute, self-ref tic suppression).
     (await import("./context")).getRecentBotMessages(env, chatId, 30, threadId),
+    // Her current rotating obsession (or null if none seeded yet — cron seeds).
+    getCurrentInterest(env, chatId),
   ]);
   // Compute days since last message for rare speaker detection
   const daysSinceLastMessage = profile.lastInteraction
     ? Math.floor((Date.now() - profile.lastInteraction) / 86_400_000)
     : undefined;
-  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage, crisis, recentCrisis, socialGraph, chatMood, currentMessage: text, recentBotMessages });
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage, crisis, recentCrisis, socialGraph, chatMood, currentMessage: text, recentBotMessages, currentInterest });
 
   // Send "typing" indicator before LLM call
   await sendChatAction(env, chatId, "typing", threadId);
@@ -1053,6 +1056,10 @@ async function handleCron(env: Env): Promise<void> {
     try {
     // 1. Drift mood + volatility
     await cronMoodShift(env, chatId);
+
+    // 1a. Rotate her current interest if old enough (3-7 day cycle, internal
+    // probabilistic decision). Cheap: one SELECT + maybe one batch UPDATE.
+    await rotateInterestIfNeeded(env, chatId).catch((e) => console.error("[CRON] rotateInterest:", e));
 
     // 1b. Generate conversation digest (RPM-guarded) — for both group and private chats
     const isGroupChat = chatId < 0;

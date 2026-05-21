@@ -13,6 +13,8 @@ import type { SocialEdge, ChatMoodSignal } from "./social";
 import { formatSocialGraph, formatChatMood } from "./social";
 import { buildAntiRepetitionBlock } from "./anti-repetition";
 import { AMONYA_BOT_ID } from "./config";
+import type { Interest } from "./interests";
+import { shouldMentionInterest, interestBlock } from "./interests";
 
 // ─── System Prompt Blocks ────────────────────────────────────────────────────
 
@@ -520,7 +522,7 @@ export function buildSystemPrompt(
   userName: string,
   chatType: "private" | "group" | "supergroup" | "channel",
   chatId: number,
-  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number; crisis?: CrisisDetection; recentCrisis?: boolean; socialGraph?: SocialEdge[]; chatMood?: ChatMoodSignal | null; currentMessage?: string; recentBotMessages?: string[] },
+  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number; crisis?: CrisisDetection; recentCrisis?: boolean; socialGraph?: SocialEdge[]; chatMood?: ChatMoodSignal | null; currentMessage?: string; recentBotMessages?: string[]; currentInterest?: Interest | null },
 ): string {
   // Crisis override: if concern/crisis detected, force serious mood and clear anger.
   // This must happen BEFORE building the prompt so moodBlock reflects override.
@@ -654,6 +656,20 @@ export function buildSystemPrompt(
   if (!hasCrisis && options?.recentBotMessages && options.recentBotMessages.length > 0) {
     const anti = buildAntiRepetitionBlock(options.recentBotMessages);
     if (anti.block) prompt += "\n\n" + anti.block;
+  }
+
+  // Living interest — probabilistic. She has one rotating obsession; whether
+  // she SURFACES it this turn depends on mood, recency, frame. When the gate
+  // says "don't mention," the block still tells the LLM the topic exists
+  // (silent tone bias). When it says "mention," she gets explicit permission.
+  if (!hasCrisis && options?.currentInterest) {
+    const verdict = shouldMentionInterest(options.currentInterest, {
+      mood: effectiveMood.mood,
+      intensity: effectiveMood.intensity,
+      recentBotMessages: options.recentBotMessages || [],
+      hasCrisis,
+    });
+    prompt += "\n\n" + interestBlock(options.currentInterest, verdict.mention);
   }
 
   // Amonya banter slice — when she's directly replying to him, the heavy
