@@ -20,6 +20,8 @@ import { maybeBookmarkMoment, getEmotionalEvents } from "./memory";
 import { buildSocialGraph, computeChatMood } from "./social";
 import { shouldGenerateDigest, generateAndStoreDigest, pruneOldDigests } from "./digests";
 import { getCurrentInterest, rotateInterestIfNeeded } from "./interests";
+import { classifyFrame } from "./frame";
+import { getRecentMixedMessages } from "./context";
 
 // ─── Export Worker ──────────────────────────────────────────────────────────
 
@@ -630,7 +632,7 @@ async function handleActiveMessage(
   const startChat = Date.now();
   // Load social intelligence + chat mood for VIP only (cost-gated — extra SQL).
   const isVip = chatId === VIP_GROUP_ID;
-  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood, recentBotMessages, currentInterest] = await Promise.all([
+  const [facts, emotionalEvents, recentCrisis, socialGraph, chatMood, recentBotMessages, currentInterest, recentMixed] = await Promise.all([
     getFacts(env, chatId, userId),
     getEmotionalEvents(env, chatId, userId),
     hasRecentCrisis(env, chatId, userId),
@@ -641,12 +643,26 @@ async function handleActiveMessage(
     (await import("./context")).getRecentBotMessages(env, chatId, 30, threadId),
     // Her current rotating obsession (or null if none seeded yet — cron seeds).
     getCurrentInterest(env, chatId),
+    // Last 10 messages (any sender) for frame classification.
+    getRecentMixedMessages(env, chatId, 10, threadId),
   ]);
+
+  // Classify the conversational frame (one cheap Flash-Lite call, 15min cache).
+  // Skipped under crisis (frame would be redundant — crisis already overrides).
+  const isCrisisActive = crisis && (crisis.severity === "concern" || crisis.severity === "crisis");
+  let frame: import("./frame").ConversationFrame | undefined;
+  if (!isCrisisActive && recentMixed.length >= 2) {
+    try {
+      frame = await classifyFrame(env, chatId, threadId, recentMixed);
+    } catch (e) {
+      console.error("[frame] classify failed:", e);
+    }
+  }
   // Compute days since last message for rare speaker detection
   const daysSinceLastMessage = profile.lastInteraction
     ? Math.floor((Date.now() - profile.lastInteraction) / 86_400_000)
     : undefined;
-  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage, crisis, recentCrisis, socialGraph, chatMood, currentMessage: text, recentBotMessages, currentInterest });
+  const systemPrompt = buildSystemPrompt(mood, profile, userName, chatType as any, chatId, { missedMessages, facts, currentUserId: userId, emotionalEvents, threadId, daysSinceLastMessage, crisis, recentCrisis, socialGraph, chatMood, currentMessage: text, recentBotMessages, currentInterest, frame });
 
   // Send "typing" indicator before LLM call
   await sendChatAction(env, chatId, "typing", threadId);

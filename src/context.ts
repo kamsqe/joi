@@ -475,6 +475,29 @@ export async function isAmonyaActive(env: Env, chatId: number, limit: number = 1
   return (row?.count || 0) > 0;
 }
 
+// ─── Get Recent Mixed Messages (for frame classification) ──────────────────
+// Returns the last N messages (any sender, including bot+forwards) in
+// chronological order. Used by frame.ts to classify the current room tone.
+
+export async function getRecentMixedMessages(
+  env: Env, chatId: number, limit: number = 10, threadId?: number,
+): Promise<{ userName: string | null; content: string; isBot: boolean }[]> {
+  const query = threadId
+    ? `SELECT user_name, content, is_bot FROM messages
+       WHERE chat_id = ? AND thread_id = ?
+       ORDER BY ts DESC LIMIT ?`
+    : `SELECT user_name, content, is_bot FROM messages
+       WHERE chat_id = ?
+       ORDER BY ts DESC LIMIT ?`;
+  const stmt = threadId
+    ? env.DB.prepare(query).bind(chatId, threadId, limit)
+    : env.DB.prepare(query).bind(chatId, limit);
+  const rows = await stmt.all<{ user_name: string | null; content: string; is_bot: number }>();
+  return (rows.results || [])
+    .reverse()
+    .map((r) => ({ userName: r.user_name, content: r.content, isBot: !!r.is_bot }));
+}
+
 // ─── Get Recent Bot Messages (for proactive dedup) ──────────────────────────
 
 export async function getRecentBotMessages(env: Env, chatId: number, limit: number = 8, threadId?: number): Promise<string[]> {

@@ -15,6 +15,8 @@ import { buildAntiRepetitionBlock } from "./anti-repetition";
 import { AMONYA_BOT_ID } from "./config";
 import type { Interest } from "./interests";
 import { shouldMentionInterest, interestBlock } from "./interests";
+import type { ConversationFrame } from "./frame";
+import { frameBlock, frameAllowsSkip } from "./frame";
 
 // ─── System Prompt Blocks ────────────────────────────────────────────────────
 
@@ -522,7 +524,7 @@ export function buildSystemPrompt(
   userName: string,
   chatType: "private" | "group" | "supergroup" | "channel",
   chatId: number,
-  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number; crisis?: CrisisDetection; recentCrisis?: boolean; socialGraph?: SocialEdge[]; chatMood?: ChatMoodSignal | null; currentMessage?: string; recentBotMessages?: string[]; currentInterest?: Interest | null },
+  options?: { missedMessages?: number; facts?: string[]; currentUserId?: number; emotionalEvents?: EmotionalEvent[]; threadId?: number; daysSinceLastMessage?: number; crisis?: CrisisDetection; recentCrisis?: boolean; socialGraph?: SocialEdge[]; chatMood?: ChatMoodSignal | null; currentMessage?: string; recentBotMessages?: string[]; currentInterest?: Interest | null; frame?: ConversationFrame },
 ): string {
   // Crisis override: if concern/crisis detected, force serious mood and clear anger.
   // This must happen BEFORE building the prompt so moodBlock reflects override.
@@ -585,6 +587,14 @@ export function buildSystemPrompt(
   // sender wasn't in VIP_MEMBERS. Anchoring the current speaker explicitly
   // before any other dynamic content fixes that.
   prompt += `\n\nСЕЙЧАС ТЕБЕ ПИШЕТ: ${userName}. Все обращения в ответе должны быть к ${userName}, не к другим участникам чата.`;
+
+  // Frame — what kind of conversation is this right now. Comes early because
+  // it changes the rules for everything below (e.g. drama-instinct gets
+  // disabled in `vent`/`tension`, [SKIP] gets explicitly enabled).
+  if (options?.frame) {
+    prompt += "\n\n" + frameBlock(options.frame);
+  }
+
   prompt += "\n\n" + timeOfDayBlock(options?.currentMessage);
 
   // S1+S3: Social graph (VIP only) — who's close, who's clashing
@@ -633,9 +643,15 @@ export function buildSystemPrompt(
     prompt += "\n\n" + timePattern;
   }
 
-  // Drama instinct — mood-conditional (dynamic). Suppressed during crisis.
+  // Drama instinct — mood-conditional (dynamic). Suppressed during crisis,
+  // and also suppressed in vent/tension/planning frames (don't add drama to
+  // someone venting, don't fuel an argument, don't joke in logistics).
   const hasCrisis = options?.crisis && options.crisis.severity !== "none";
-  if (chatId === VIP_GROUP_ID && !hasCrisis && ["playful", "manic", "unhinged"].includes(effectiveMood.mood) && effectiveMood.intensity >= 60) {
+  const dramaSafeFrame = !options?.frame
+    || (options.frame !== "vent" && options.frame !== "tension" && options.frame !== "planning");
+  if (chatId === VIP_GROUP_ID && !hasCrisis && dramaSafeFrame
+      && ["playful", "manic", "unhinged"].includes(effectiveMood.mood)
+      && effectiveMood.intensity >= 60) {
     prompt += "\n\n" + dramaInstinctBlock();
   }
 
