@@ -671,7 +671,21 @@ export function buildSystemPrompt(
   // (don't want a "don't say X" directive interfering with empathy).
   if (!hasCrisis && options?.recentBotMessages && options.recentBotMessages.length > 0) {
     const anti = buildAntiRepetitionBlock(options.recentBotMessages);
-    if (anti.block) prompt += "\n\n" + anti.block;
+    if (anti.block) {
+      prompt += "\n\n" + anti.block;
+      // Observability — log what got suppressed this turn so we can see
+      // which guards are actually firing in prod and tune thresholds.
+      console.log(JSON.stringify({
+        event: "anti_repetition_fired",
+        chatId,
+        threadId: options?.threadId ?? null,
+        userId: options?.currentUserId ?? null,
+        overusedOpeners: anti.overusedOpeners,
+        mutedCanon: anti.mutedCanon,
+        mutedJargon: anti.mutedJargon,
+        selfRefCount: anti.suppressedSelfRefs,
+      }));
+    }
   }
 
   // Living interest — probabilistic. She has one rotating obsession; whether
