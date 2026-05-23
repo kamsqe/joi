@@ -861,13 +861,20 @@ export async function callLLMChat(
     ? env.GEMINI_API_VIP_GROUP_KEY
     : env.GEMINI_API_TELEGRAM_JOI;
 
+  // Model selection: VIP group keeps Flash (the heavy 6-7K token system
+  // prompt + social graph + member registry really benefits from the bigger
+  // model). Private DMs go to Flash-Lite — prompt is smaller, conversations
+  // are simpler, and Flash-Lite handles them well at ~3-8x lower cost.
+  // Per cost audit 2026-05-22.
+  const model = chatId === VIP_GROUP_ID ? CHAT_MODEL : LITE_MODEL;
+
   const result = await callGemini(
     apiKey,
     messages,
     systemPrompt,
     maxTokens,
     temperature,
-    CHAT_MODEL,
+    model,
   );
 
   return result ? sanitizeResponse(result) : null;

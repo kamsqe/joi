@@ -107,3 +107,29 @@ export async function getActiveChats(env: Env): Promise<number[]> {
 
   return (rows.results || []).map((r) => r.chat_id);
 }
+
+// ─── Prune Stale Active Chats (called by cron) ──────────────────────────────
+// Drops active_chats rows where the chat has no messages in the last 30 days
+// (and is older than 7d since registration so first-time chats aren't pruned
+// before they get a chance). Per cost audit 2026-05-22: every active_chats
+// row eats one cron iteration every 5min — that's 8,640 wasted iterations
+// per month per stale chat. Catches the Boss DM (0 messages, registered Apr 12).
+
+export async function pruneStaleActiveChats(env: Env): Promise<number> {
+  const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+  const result = await env.DB.prepare(
+    `DELETE FROM active_chats
+     WHERE registered_at < ?
+       AND chat_id NOT IN (
+         SELECT DISTINCT chat_id FROM messages WHERE ts > ?
+       )`,
+  ).bind(sevenDaysAgo, thirtyDaysAgo).run();
+
+  const deleted = (result.meta as { changes?: number } | undefined)?.changes ?? 0;
+  if (deleted > 0) {
+    console.log(JSON.stringify({ event: "stale_chats_pruned", count: deleted }));
+  }
+  return deleted;
+}

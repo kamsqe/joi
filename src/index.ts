@@ -3,7 +3,7 @@
 import type { Env, TelegramMessage } from "./config";
 import { BOT_USERNAME, BOT_NAME_VARIANTS, VIP_GROUP_ID, VIP_PROACTIVE_TOPIC_ID, RUSTEM_USER_ID, AMONYA_BOT_ID } from "./config";
 import { parseUpdate, sendMessage, sendSticker, sendChatAction, setMessageReaction, formatForTelegram } from "./telegram";
-import { resolveUserName, registerActiveChat, getActiveChats, isFirstContact, isThirdPartyNicknameRequest } from "./users";
+import { resolveUserName, registerActiveChat, getActiveChats, isFirstContact, isThirdPartyNicknameRequest, pruneStaleActiveChats } from "./users";
 import { saveUserMessage, saveBotMessage, pruneOldMessages } from "./context";
 import { detectCrisis, hasRecentCrisis, saveCrisisEvent } from "./crisis";
 import type { CrisisDetection } from "./crisis";
@@ -175,9 +175,10 @@ async function handleMessage(env: Env, ctx: ExecutionContext, message: TelegramM
     // G2: Sample qualifying passive messages for full sentiment+facts analysis.
     // Without this, VIP sentimentAvg freezes (90%+ messages are passive, never sampled).
     // When sampled, we get sentiment (updates relationship) AND facts in one LLM call.
-    // Bumped from len>=15 / 10% to len>=12 / 20% — month of prod showed only 11 facts
-    // saved across 2 users, undersampling was starving memory.
-    const shouldSample = text && text.length >= 12 && Math.random() < 0.2;
+    // History: started at 10%, bumped to 20% on May 21 to recover from severe
+    // undersampling, dialed back to 15% on May 22 per cost audit — VIP volume
+    // is high enough that 15% still keeps profile sentiment + facts populating.
+    const shouldSample = text && text.length >= 12 && Math.random() < 0.15;
     if (shouldSample && text) {
       const repliedToBotPassive = message.reply_to_message?.from?.username === BOT_USERNAME;
       const botMsgIdPassive = repliedToBotPassive ? message.reply_to_message?.message_id : undefined;
@@ -1065,6 +1066,10 @@ async function handleCron(env: Env): Promise<void> {
   await pruneOldMessages(env);
   await pruneExpiredRateLimits(env);
   await pruneOldDigests(env);
+  // Drop chats with no messages in 30+ days (and registered 7d+ ago) so
+  // cron doesn't iterate them every 5 minutes — each stale chat wastes
+  // 8,640 cron-iterations per month.
+  await pruneStaleActiveChats(env);
 
   const chatIds = await getActiveChats(env);
 

@@ -23,7 +23,10 @@ export type ConversationFrame =
   | "tension"     // disagreement turning sour; don't fuel
   | "dead";       // silence/scrolling; nothing to react to
 
-const CACHE_TTL_MS = 15 * 60 * 1000;
+// Cache TTL bumped 15→30 min per cost audit 2026-05-22. Room tone doesn't
+// usually shift within 30 minutes and the halved call rate noticeably trims
+// Flash-Lite usage.
+const CACHE_TTL_MS = 30 * 60 * 1000;
 
 interface FrameCacheRow {
   data: string | null;
